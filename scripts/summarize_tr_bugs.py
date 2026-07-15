@@ -224,14 +224,32 @@ Be specific and actionable — a QA engineer will execute this directly.
 
 Fixed bugs:
 {chr(10).join(blocks)}
+
+Begin the report now. Output ONLY the markdown report starting with the heading
+"# Per-Bug Verification". Do not ask questions, do not add any preamble or offer
+options — write the full report directly.
 """
     return prompt, total
+
+
+SYSTEM_PROMPT = (
+    "You are a senior QA engineer generating a test-focus report. You always "
+    "respond with the finished markdown report only — never ask clarifying "
+    "questions, never offer menus of options, never add conversational preamble. "
+    "Follow the requested section structure exactly."
+)
 
 
 def call_ollama(prompt: str, model: str, ollama_url: str, timeout: int) -> str:
     req = urllib.request.Request(
         f"{ollama_url}/api/generate",
-        data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode("utf-8"),
+        data=json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "system": SYSTEM_PROMPT,
+            "stream": False,
+            "options": {"temperature": 0.2},
+        }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
