@@ -1,0 +1,287 @@
+{
+  "name": "(TR Report) Get Bug Details_v1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "9f21c4d8-3b7a-4a05-8e2f-6d4c1b90a7e3-v1",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -208,
+        288
+      ],
+      "id": "1a7c9d2e-5b31-4f80-9a44-3c6e8f01b2d7",
+      "name": "Webhook",
+      "webhookId": "9f21c4d8-3b7a-4a05-8e2f-6d4c1b90a7e3"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "b1c2d3e4-0001-4000-a000-000000000001",
+              "leftValue": "={{ Array.isArray($json.body.bug_codes) && $json.body.bug_codes.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        16,
+        288
+      ],
+      "id": "2b8d0e3f-6c42-4a91-8b55-4d7f9a12c3e8",
+      "name": "Has Bug Codes?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the webhook's bug_codes array (or comma-separated string) into one item per BugCode\nconst body = $('Webhook').first().json.body || {};\nconst codes = Array.isArray(body.bug_codes)\n  ? body.bug_codes\n  : String(body.bug_codes || '').split(',');\nconst seen = new Set();\nconst out = [];\nfor (const c of codes) {\n  const code = String(c || '').trim();\n  if (code && !seen.has(code)) {\n    seen.add(code);\n    out.push({ json: { BugCode: code } });\n  }\n}\nif (!out.length) {\n  throw new Error('bug_codes was provided but contained no valid bug codes.');\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        128
+      ],
+      "id": "3c9e1f40-7d53-4ba2-9c66-5e80ab23d4f9",
+      "name": "Bug Codes → Items"
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 50000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $('Webhook').item.json.body.date_from || $now.minus($('Webhook').item.json.body.duration_months || 12, 'month').format('yyyy-MM-dd') + ' 00:00:00' }}\",\n        \"lte\": \"{{ $('Webhook').item.json.body.date_to || $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"{{ $('Webhook').item.json.body.product_name }}\"]\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        256,
+        432
+      ],
+      "id": "4d0f2a51-8e64-4cb3-ad77-6f91bc34e50a",
+      "name": "Get Bug List (Product Window)",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "edMebIct1x35zHDJ",
+          "name": "eCL Key account 79"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        480,
+        432
+      ],
+      "id": "5e1a3b62-9f75-4dc4-be88-70a2cd45f61b",
+      "name": "Split Out Results"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only bugs whose Close Build# matches the requested TR build\nconst body = $('Webhook').first().json.body || {};\nconst target = String(body.close_build || '').trim();\nif (!target) {\n  throw new Error('Request must include either bug_codes or close_build.');\n}\nconst seen = new Set();\nconst out = [];\nfor (const item of $input.all()) {\n  const b = item.json;\n  const cb = String(b.CloseToBuild ?? b['Close Build#'] ?? '').trim();\n  if (!cb) continue;\n  // Lenient match: exact, or one contains the other (lets you pass just \"185409\")\n  if (cb === target || cb.includes(target) || target.includes(cb)) {\n    const code = String(b.BugCode || '').trim();\n    if (code && !seen.has(code)) {\n      seen.add(code);\n      out.push({ json: { BugCode: code, CloseToBuild: cb } });\n    }\n  }\n}\nif (!out.length) {\n  throw new Error('No closed bugs matched close_build \"' + target + '\" for ' + (body.product_name || 'the requested product') + ' in the last ' + (body.duration_months || 12) + ' months.');\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        704,
+        432
+      ],
+      "id": "6f2b4c73-a086-4ed5-cf99-81b3de56a72c",
+      "name": "Filter by Close Build#"
+    },
+    {
+      "parameters": {
+        "operation": "getOldeBug",
+        "BugCode": "={{ $json.BugCode }}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        928,
+        288
+      ],
+      "id": "7a3c5d84-b197-4fe6-d0aa-92c4ef67b83d",
+      "name": "Get eBug Detail",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "mqmQP0HX5dELWd65",
+          "name": "ECL Key account 6"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group full bug details by product, parsing the eBug JSON-string fields\n// (StatusLog / Comments / DetailData / UploadFile) into structured data so the\n// downstream AI step gets clean root-cause / repro / verify text, not raw blobs.\nconst body = $('Webhook').first().json.body || {};\n\nfunction parseJSONField(v) {\n  if (v == null) return null;\n  if (typeof v !== 'string') return v;\n  try { return JSON.parse(v); } catch (e) { return null; }\n}\n\nconst products = {};\nconst errors = [];\nlet count = 0;\n\nfor (const item of $input.all()) {\n  const raw = item.json || {};\n  // getOldeBug failures (e.g. flaky tsr API) arrive as an error item — record & skip\n  if (raw.error && !raw.BugCode) {\n    errors.push(String((raw.error && raw.error.message) || raw.error));\n    continue;\n  }\n  // Unwrap common single-record wrappers\n  let d = raw;\n  for (const k of ['result', 'results', 'data', 'ebug', 'eBug']) {\n    if (d && typeof d[k] === 'object' && d[k] !== null) d = d[k];\n  }\n  if (Array.isArray(d)) d = d[0] || {};\n\n  const product = d.ProductName || d.productName || body.product_name || 'Unknown';\n\n  const statusLog = parseJSONField(d.StatusLog) || [];\n  const comments  = parseJSONField(d.Comments) || [];\n  const detail    = parseJSONField(d.DetailData) || [];\n  const uploads   = parseJSONField(d.UploadFile) || [];\n\n  // Repro steps + locale coverage live inside DetailData field objects\n  let reproSteps = null, osLanguage = null, priorityLabel = null, severityLabel = null;\n  for (const f of (Array.isArray(detail) ? detail : [])) {\n    const key = String(f.FieldCode || f.FieldName || '').toLowerCase();\n    if (key.includes('describe')) reproSteps = f.FieldValue;\n    else if (key.includes('os language')) osLanguage = f.FieldValue;\n    else if (key === 'priority') priorityLabel = f.FieldValue;\n    else if (key === 'severity') severityLabel = f.FieldValue;\n  }\n\n  // Resolutions = StatusLog entries that carry RD fix info (root cause / solution)\n  const resolutions = (Array.isArray(statusLog) ? statusLog : [])\n    .filter((s) => s && (s.RootCause || s.Solution))\n    .map((s) => ({\n      user: s.UserName || null,\n      time: s.StatusTime || null,\n      root_cause: s.RootCause || null,\n      solution: s.Solution || null,\n      risk: s.Risk || null,\n      trace_url: s.TraceURL || null,\n    }));\n\n  const timeline = (Array.isArray(statusLog) ? statusLog : [])\n    .map((s) => ({ status: s.Status || null, user: s.UserName || null, time: s.StatusTime || null }));\n\n  const verifyComments = (Array.isArray(comments) ? comments : [])\n    .map((c) => ({ user: c.UserName || null, time: c.CommentTime || null, comment: c.Comment || null }));\n\n  const normalized = {\n    BugCode: d.BugCode || raw.BugCode || '',\n    ProductName: product,\n    ParentTRCode: d.ParentTRCode || null,\n    Status: d.Status !== undefined ? d.Status : null,\n    Priority: d.EbugPriority !== undefined ? d.EbugPriority : (d.Priority !== undefined ? d.Priority : null),\n    Severity: d.EbugSeverity !== undefined ? d.EbugSeverity : (d.Severity !== undefined ? d.Severity : null),\n    PriorityLabel: priorityLabel,\n    SeverityLabel: severityLabel,\n    'Short Description': d.ShortDescription !== undefined ? d.ShortDescription : (d['Short Description'] !== undefined ? d['Short Description'] : null),\n    ReproSteps: reproSteps,\n    OSLanguage: osLanguage,\n    ModuleOwner: d.BugBelong || d.IssueHandler || null,\n    'Create Date': d.CreateTime !== undefined ? d.CreateTime : null,\n    'Closed Date': d.CloseTime !== undefined ? d.CloseTime : null,\n    'Build#': d.Build !== undefined ? d.Build : null,\n    'Close Build#': d.CloseToBuild !== undefined ? d.CloseToBuild : null,\n    Creator: d.Creator !== undefined ? d.Creator : null,\n    Handler: d.MainHandler || d.Handler || null,\n    Resolutions: resolutions,\n    StatusTimeline: timeline,\n    VerifyComments: verifyComments,\n    AttachmentCount: Array.isArray(uploads) ? uploads.length : 0,\n    raw: d,\n  };\n\n  if (!products[product]) products[product] = [];\n  products[product].push(normalized);\n  count++;\n}\n\nconst allBugs = Object.values(products).reduce((a, b) => a.concat(b), []);\nconst trCodes = [...new Set(allBugs.map((b) => b.ParentTRCode).filter(Boolean))];\n\nreturn [{\n  json: {\n    meta: {\n      requested_product: body.product_name || null,\n      close_build: body.close_build || null,\n      bug_codes_supplied: Array.isArray(body.bug_codes) ? body.bug_codes.length : 0,\n      fetched_at: $now.toISO(),\n      bug_count: count,\n      products: Object.keys(products),\n      tr_codes: trCodes,\n      errors: errors,\n    },\n    products: products,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        288
+      ],
+      "id": "8b4d6e95-c2a8-4a07-e1bb-a3d5f078c94e",
+      "name": "Organize by Product"
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1376,
+        288
+      ],
+      "id": "9c5e7fa6-d3b9-4b18-f2cc-b4e60189da5f",
+      "name": "Respond to Webhook"
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "body": {
+            "product_name": "PowerDirector Mobile for iOS",
+            "close_build": "16.5.0.185409",
+            "duration_months": 12
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Has Bug Codes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Bug Codes?": {
+      "main": [
+        [
+          {
+            "node": "Bug Codes → Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Bug List (Product Window)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bug Codes → Items": {
+      "main": [
+        [
+          {
+            "node": "Get eBug Detail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Bug List (Product Window)": {
+      "main": [
+        [
+          {
+            "node": "Split Out Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out Results": {
+      "main": [
+        [
+          {
+            "node": "Filter by Close Build#",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter by Close Build#": {
+      "main": [
+        [
+          {
+            "node": "Get eBug Detail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get eBug Detail": {
+      "main": [
+        [
+          {
+            "node": "Organize by Product",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Organize by Product": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "tr-report-v1-002",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e9bed60b3a9169dc966f0ab2014f06e4196f08528b8b81b71c0556b4c3f2c51b"
+  },
+  "tags": []
+}
