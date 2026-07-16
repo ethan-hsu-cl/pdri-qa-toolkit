@@ -15,7 +15,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 | 2 | `scripts/compute_risk_scores.py` | v2.4 | Module metric aggregation → risk register (recency-ordered, sparse-skipping) |
 | 3 | `scripts/ai_risk_scorer.py` | v2.4 | Impact/Detectability scoring (heuristic / Ollama / OpenAI) with resume/checkpoint |
 | 4 | `scripts/auto_tag_tests.py` | **v3.0** | pytest skeleton generator + Allure decorators + per-theme test methods + cluster test plan |
-| 5 | `scripts/bug_heatmap_dashboard.py` | **v3.2** | Streamlit dashboard — 9 tabs, 4-step sidebar; velocity/entropy charts; per-theme forecast cards |
+| 5 | `scripts/bug_heatmap_dashboard.py` | **v3.2** | Streamlit dashboard — 11 tabs including Release Pulse and TR Test Focus; velocity/entropy charts; per-theme forecast cards |
 | 6 | `scripts/cluster_bugs.py` | **v3.0** | TF-IDF / Ollama clustering + velocity/trend/recurrence metrics + severity stratification + module entropy |
 | 7 | `scripts/predict_defects.py` | **v3.2** | Gradient Boosting prediction + status-weighted bug counts + cluster-aware features + per-theme forecasts |
 | 8 | `scripts/visual_regression.py` | v2.1 | Screenshot diff engine |
@@ -27,6 +27,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 | 14 | `tests/test_ai_storytelling.py` | — | Example P1 test |
 | 15 | `setup_mac_mini.sh` | — | One-command M1 setup + LaunchAgent |
 | 16 | `n8n/Dashboard_Query_eBug_List_v3.json` | v3 | n8n workflow — queries eCL eBug API and returns normalised bug records |
+| 17 | `scripts/process_newest_tr.py` | v1.0 | Detect newly closed bugs in the newest TR, fetch full status logs, and generate the test-focus report |
+| 18 | `scripts/summarize_tr_bugs.py` | v1.0 | Turn TR bug fixes/root causes into per-bug verification and adjacent regression recommendations |
+| 19 | `(TR Report) Get Bug Details_v1.json` | v1 | Importable n8n workflow for organized full bug details grouped by product |
 
 ***
 
@@ -65,6 +68,11 @@ pdri-qa-toolkit/
 │   │   ├── ecl_parsed_predictions_focus_summary.txt
 │   │   ├── ecl_parsed_predictions_leading_indicators.csv
 │   │   └── ecl_parsed_predictions_importance.csv
+│   ├── tr_reports/                              ← newest-TR fixed-bug analysis
+│   │   ├── latest.json                          ← dashboard pointer/metadata
+│   │   └── <close_build>/
+│   │       ├── bug_details.json                 ← organized full eBug status logs
+│   │       └── test_focus_summary.md            ← actionable AI QA report
 │   ├── quadrant_summary.md                      ← Step 3.3 output (P1/P2 now include themes, v3.0)
 │   └── cluster_test_plan.md                     ← Step 3.3 output (new in v3.0)
 ├── scripts/

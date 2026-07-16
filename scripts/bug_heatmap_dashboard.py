@@ -255,6 +255,7 @@ TAB_NAMES = [
     "🔬 Bug Clusters",
     "🔮 Defect Forecast",
     "🎯 Release Pulse",
+    "🧪 TR Test Focus",
 ]
 
 SEV_OPTIONS = ["All", "1-Critical", "2-Major", "3-Normal", "4-Minor"]
@@ -4801,3 +4802,262 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                                 _src = _row["based_on"] or "—"
                                 st.markdown(f"- **{_row['module']}** — {_row['scenario']}  _(based_on: {_src})_")
                                 _render_anno_controls(_row["module"], _row["scenario"], _row.get("based_on", ""))
+
+
+# =====================================================================
+# TAB 11 – TR Test Focus  (newest TR fixed bugs → actionable QA report)
+# =====================================================================
+
+elif active_tab == "🧪 TR Test Focus":
+    import re as _tr_re
+
+    st.markdown("""
+<style>
+.tr-focus-hero {
+    padding: 1.25rem 1.4rem;
+    margin: 0 0 1rem;
+    border: 1px solid rgba(99, 102, 241, .24);
+    border-radius: 18px;
+    background: linear-gradient(135deg, rgba(99, 102, 241, .13), rgba(14, 165, 233, .07));
+}
+.tr-focus-hero .eyebrow {
+    color: #6366f1;
+    font-size: .76rem;
+    font-weight: 750;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+}
+.tr-focus-hero h2 { margin: .3rem 0 .35rem; }
+.tr-focus-hero p { margin: 0; opacity: .78; }
+.tr-metric-grid {
+    display: grid;
+    grid-template-columns: 1fr .7fr 1.65fr;
+    gap: 1rem;
+    margin: .25rem 0 .8rem;
+}
+.tr-metric-card {
+    min-width: 0;
+    padding: .9rem 1rem 1rem;
+    border: 1px solid rgba(99, 102, 241, .18);
+    border-radius: 14px;
+    background: rgba(99, 102, 241, .045);
+}
+.tr-metric-label {
+    margin-bottom: .5rem;
+    font-size: .82rem;
+    font-weight: 650;
+    opacity: .78;
+}
+.tr-metric-note {
+    margin: -.25rem 0 .55rem;
+    font-size: .72rem;
+    line-height: 1.35;
+    opacity: .62;
+}
+.tr-metric-value {
+    font-size: 1.85rem;
+    font-weight: 650;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+}
+.tr-code-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+}
+.tr-code-chip {
+    padding: .25rem .55rem;
+    border: 1px solid rgba(99, 102, 241, .28);
+    border-radius: 999px;
+    background: rgba(99, 102, 241, .09);
+    font-size: .9rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+@media (max-width: 760px) {
+    .tr-metric-grid { grid-template-columns: 1fr; }
+}
+div[data-testid="stExpander"] { border-radius: 12px; }
+</style>
+<div class="tr-focus-hero">
+  <div class="eyebrow">Release confidence</div>
+  <h2>🧪 Newest TR Test Focus</h2>
+  <p>Start with the highest-risk regression areas, then work through each fixed-bug checklist.</p>
+</div>
+""", unsafe_allow_html=True)
+
+    st.caption(
+        "Verification checklists and adjacent regression recommendations generated "
+        "from the newest TR's included-bug status logs and RD fix details."
+    )
+
+    with st.expander("📖 How this report is generated", expanded=False):
+        st.markdown("""
+The refresh pipeline selects the newest version's **TRCreated** bugs—the cohort
+shown as "RD Resolved Bug" in the Testing Request—derives its dominant
+**Close Build#**, and fetches each bug through the TR-detail n8n workflow.
+**Bug Creation TRs** are retained only as provenance: each value is the parent
+TR where one or more bugs originated, not the Testing Request for the displayed
+Close Build.
+Ollama then produces:
+
+1. **Recommended Regression Areas** — other shared modules and code paths QA
+   should check, ranked by risk.
+2. **Per-Bug Verification** — concrete steps for confirming every included fix.
+
+The tab always shows the latest successfully validated report for the selected
+product. An older report remains available if a later fetch or AI run fails.
+""")
+
+    _tr_latest_fp = Path(_product_dir) / "tr_reports" / "latest.json"
+    if not _tr_latest_fp.exists():
+        st.info(
+            "No fixed-bug TR report has been generated for this product yet. "
+            "Run the refresh pipeline when the newest version has a `TRCreated` cohort."
+        )
+    else:
+        try:
+            _tr_manifest = json.loads(_tr_latest_fp.read_text(encoding="utf-8"))
+            _tr_build = str(_tr_manifest.get("close_build") or "Unknown")
+            _tr_codes = [str(v) for v in (_tr_manifest.get("tr_codes") or [])]
+            _tr_bug_codes = [str(v) for v in (_tr_manifest.get("bug_codes") or [])]
+            _tr_bug_count = int(_tr_manifest.get("bug_count") or len(_tr_bug_codes))
+            _tr_missing_details = [
+                str(v) for v in (_tr_manifest.get("missing_detail_bug_codes") or [])
+            ]
+            _tr_generated = str(_tr_manifest.get("generated_at") or "")
+            _tr_report_fp = Path(str(_tr_manifest.get("report_path") or ""))
+
+            import html as _tr_html
+
+            _tr_code_chips = "".join(
+                f'<span class="tr-code-chip">{_tr_html.escape(code)}</span>'
+                for code in _tr_codes
+            ) or '<span class="tr-code-chip">Not supplied</span>'
+            st.markdown(f"""
+<div class="tr-metric-grid">
+  <div class="tr-metric-card">
+    <div class="tr-metric-label">Close Build</div>
+    <div class="tr-metric-value">{_tr_html.escape(_tr_build)}</div>
+  </div>
+  <div class="tr-metric-card">
+    <div class="tr-metric-label">Fixed bugs analyzed</div>
+    <div class="tr-metric-value">{_tr_bug_count}</div>
+  </div>
+  <div class="tr-metric-card">
+    <div class="tr-metric-label">Bug Creation TRs</div>
+    <div class="tr-metric-note">Parent TRs where these bugs were originally created—not the TR for this Close Build.</div>
+    <div class="tr-code-list">{_tr_code_chips}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+            if _tr_generated:
+                st.caption(f"Generated {_tr_generated.replace('T', ' ')[:19]}")
+
+            if _tr_missing_details:
+                _tr_missing_links = " · ".join(
+                    f"[{code}]({ECL_BUG_URL.format(bug_code=code)})"
+                    for code in _tr_missing_details
+                )
+                st.warning(
+                    "Full eBug status logs were unavailable after retries for: "
+                    + _tr_missing_links
+                    + ". List-level metadata was used for these bugs."
+                )
+
+            if _tr_report_fp.exists():
+                _tr_report_text = _tr_report_fp.read_text(encoding="utf-8")
+                # Hide the machine-readable generation comment from the UI.
+                _tr_report_text = _tr_re.sub(
+                    r"^<!--.*?-->\s*", "", _tr_report_text,
+                    count=1, flags=_tr_re.DOTALL,
+                )
+                _tr_sections = {}
+                _tr_headings = list(_tr_re.finditer(
+                    r"^#\s+(Recommended Regression Areas|Per-Bug Verification)\s*$",
+                    _tr_report_text, flags=_tr_re.I | _tr_re.M,
+                ))
+                for _tr_idx, _tr_match in enumerate(_tr_headings):
+                    _tr_end = (
+                        _tr_headings[_tr_idx + 1].start()
+                        if _tr_idx + 1 < len(_tr_headings)
+                        else len(_tr_report_text)
+                    )
+                    _tr_sections[_tr_match.group(1).lower()] = (
+                        _tr_report_text[_tr_match.end():_tr_end].strip()
+                    )
+
+                _tr_regression = _tr_sections.get("recommended regression areas", "")
+                _tr_verification = _tr_sections.get("per-bug verification", "")
+                # Older reports used plain newlines between bold module names;
+                # Markdown renders those as one paragraph. Promote each entry
+                # to a bullet so modules/features remain visually distinct.
+                _tr_regression = _tr_re.sub(
+                    r"(?m)^(?=\*\*[^*\n]+\*\*\s*[-–—:])",
+                    "- ",
+                    _tr_regression,
+                )
+
+                st.markdown("### 🎯 Recommended Regression Areas")
+                st.caption("Prioritized cross-feature checks to run before the individual bug list.")
+                with st.container(border=True):
+                    if _tr_regression:
+                        st.markdown(_tr_regression)
+                    else:
+                        st.info("No regression recommendations were found in this report.")
+
+                st.markdown("### ✅ Per-Bug Verification")
+                _tr_filter = st.text_input(
+                    "Filter verification checklists",
+                    placeholder="Enter a BugCode, feature, locale, or keyword…",
+                    key=f"tr_test_focus_filter_{selected_slug}",
+                ).strip().lower()
+                _tr_bug_blocks = _tr_re.split(
+                    r"(?=^##\s+[A-Za-z]{2,}\d{6}-\d+\s*$)",
+                    _tr_verification, flags=_tr_re.M,
+                )
+                _tr_bug_blocks = [block.strip() for block in _tr_bug_blocks if block.strip()]
+                _tr_visible_blocks = [
+                    block for block in _tr_bug_blocks
+                    if not _tr_filter or _tr_filter in block.lower()
+                ]
+                st.caption(
+                    f"Showing {len(_tr_visible_blocks)} of {len(_tr_bug_blocks)} checklists. "
+                    "Expand a bug to see its steps."
+                )
+                for _tr_block in _tr_visible_blocks:
+                    _tr_code_match = _tr_re.match(
+                        r"^##\s+([A-Za-z]{2,}\d{6}-\d+)\s*$",
+                        _tr_block, flags=_tr_re.M,
+                    )
+                    _tr_code = _tr_code_match.group(1) if _tr_code_match else "Checklist"
+                    _tr_body = (
+                        _tr_block[_tr_code_match.end():].strip()
+                        if _tr_code_match else _tr_block
+                    )
+                    with st.expander(f"🐛 {_tr_code}", expanded=False):
+                        st.markdown(_tr_body)
+                        if _tr_code != "Checklist":
+                            st.markdown(
+                                f"[Open {_tr_code} in eCL ↗]"
+                                f"({ECL_BUG_URL.format(bug_code=_tr_code)})"
+                            )
+
+                if _tr_filter and not _tr_visible_blocks:
+                    st.info("No verification checklist matches that filter.")
+
+                if _tr_bug_codes:
+                    with st.expander(f"🔗 Open source bugs ({len(_tr_bug_codes)})",
+                                     expanded=False):
+                        _tr_links = [
+                            f"[{code}]({ECL_BUG_URL.format(bug_code=code)})"
+                            for code in _tr_bug_codes
+                        ]
+                        st.markdown(" · ".join(_tr_links))
+            else:
+                st.warning(
+                    "The TR manifest exists, but its report file is missing: "
+                    f"`{_tr_report_fp}`"
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as _tr_err:
+            st.warning(f"Could not load newest TR test-focus report: {_tr_err}")

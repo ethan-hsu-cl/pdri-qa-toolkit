@@ -185,6 +185,12 @@ def save_json(records: list[dict], output_path: str) -> dict:
             except json.JSONDecodeError:
                 print("⚠️  Could not parse existing JSON — treating as empty cache.")
 
+    # Flags describe transitions observed by *this* fetch. Clear every cached
+    # record first, including records omitted by a narrow latest-version fetch;
+    # otherwise an older True flag can repeatedly trigger newest-TR processing.
+    for old in existing_map.values():
+        old["_status_changed"] = False
+
     n_new = n_updated = n_unchanged = 0
 
     for rec in tqdm(records, desc="Merging records", unit="bug", file=sys.stderr):
@@ -205,8 +211,8 @@ def save_json(records: list[dict], output_path: str) -> dict:
                 existing_map[code]     = rec
                 n_updated += 1
             else:
-                # Always reset flag so a record from a previous run is not
-                # stuck with _status_changed=True after it stabilises.
+                # The pre-merge reset above also handles cached records that
+                # were not included in this fetch.
                 rec["_status_changed"] = False
                 existing_map[code]     = rec
                 n_unchanged += 1

@@ -5,8 +5,8 @@ Reads the bug_details.json produced by fetch_tr_bug_details.py, feeds each
 fixed bug's description + status-log text to a local Ollama model, and writes
 a markdown test-focus report next to the input file:
 
-  1. Per-bug verification — what to check to confirm each fix
-  2. Recommended regression areas — other sections/modules worth re-testing
+  1. Recommended regression areas — other sections/modules worth re-testing
+  2. Per-bug verification — what to check to confirm each fix
 
 Usage:
     python scripts/summarize_tr_bugs.py data/products/pdri/tr_reports/<label>/bug_details.json
@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -129,7 +130,7 @@ def build_bug_block(bug: dict, max_log_chars: int) -> str:
     """
     tr = bug.get("ParentTRCode")
     lines = [
-        f"### {bug.get('BugCode', '?')}" + (f"  (TR {tr})" if tr else ""),
+        f"### {bug.get('BugCode', '?')}" + (f"  (bug created from TR {tr})" if tr else ""),
         f"- Module owner: {bug.get('ModuleOwner') or '(unknown)'} | "
         f"Severity: {bug.get('SeverityLabel') or bug.get('Severity')} | "
         f"Priority: {bug.get('PriorityLabel') or bug.get('Priority')} | "
@@ -142,6 +143,9 @@ def build_bug_block(bug: dict, max_log_chars: int) -> str:
         lines.append(f"- Repro / description: {repro}")
     if bug.get("OSLanguage"):
         lines.append(f"- Locale/OS coverage: {bug['OSLanguage']}")
+    if bug.get("DetailFetchError"):
+        lines.append(f"- Detail warning: {bug['DetailFetchError']}; verify from the summary "
+                     "and flag the missing RD root-cause/status log in the report.")
 
     resolutions = bug.get("Resolutions") or []
     if resolutions:
@@ -201,17 +205,16 @@ def build_prompt(data: dict, max_bugs: int, max_log_chars: int) -> tuple[str, in
     build = meta.get("close_build") or "the newest TR"
     # meta.tr_codes is only present on newer-workflow files; derive otherwise.
     tr_codes = meta.get("tr_codes") or sorted(set(derived_tr_codes))
-    tr_line = f" (TRs: {', '.join(tr_codes)})" if tr_codes else ""
+    tr_line = (
+        f" (bug creation/parent TRs: {', '.join(tr_codes)}; these are provenance, "
+        "not the Testing Request for this Close Build)"
+        if tr_codes else ""
+    )
     prompt = f"""You are a senior QA engineer for CyberLink's video/photo editing apps.
-The following {total} bugs were fixed and closed in TR build {build}{tr_line}.
+The following {total} bugs are included in TR build {build}{tr_line}.
 For each bug you get its summary, repro steps, the RD root-cause/fix, and QA verify notes.
 
 Write a test-focus report in markdown with EXACTLY these two sections:
-
-# Per-Bug Verification
-For each bug (reference its BugCode): 2-4 concrete verification steps to confirm the fix,
-including the specific feature/template/setting named in the bug. Note any device,
-locale (e.g. ESM/PTB/JPN), or content preconditions mentioned.
 
 # Recommended Regression Areas
 Based on what the fixes touched (infer the affected modules/components from the
@@ -219,14 +222,21 @@ descriptions and fix logs): which OTHER sections of the app should be regression
 because they share code paths or were likely disturbed by these fixes. Group by module,
 explain the reasoning in one sentence each, and rank by risk.
 
+# Per-Bug Verification
+For each bug (reference its BugCode): 2-4 concrete verification steps to confirm the fix,
+including the specific feature/template/setting named in the bug. Note any device,
+locale (e.g. ESM/PTB/JPN), or content preconditions mentioned.
+
 Be specific and actionable — a QA engineer will execute this directly.
+Keep each bug concise: output only 2-4 numbered verification steps beneath its
+BugCode. Do not repeat the supplied summary, root cause, code URL, or metadata.
 {"NOTE: bug list was truncated to " + str(max_bugs) + " bugs." if truncated else ""}
 
 Fixed bugs:
 {chr(10).join(blocks)}
 
 Begin the report now. Output ONLY the markdown report starting with the heading
-"# Per-Bug Verification". Do not ask questions, do not add any preamble or offer
+"# Recommended Regression Areas". Do not ask questions, do not add any preamble or offer
 options — write the full report directly.
 """
     return prompt, total
@@ -248,13 +258,223 @@ def call_ollama(prompt: str, model: str, ollama_url: str, timeout: int) -> str:
             "prompt": prompt,
             "system": SYSTEM_PROMPT,
             "stream": False,
-            "options": {"temperature": 0.2},
+            "think": False,
+            # A large TR can contain dozens of bugs. The Ollama default output
+            # limit truncates the report after only a few, so reserve enough
+            # tokens for every per-bug checklist plus regression areas.
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 8192,
+                "num_predict": 1600,
+            },
         }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8")).get("response", "")
+
+
+def expected_bug_codes(data: dict, max_bugs: int) -> list[str]:
+    codes: list[str] = []
+    for bugs in data.get("products", {}).values():
+        for bug in bugs:
+            if len(codes) >= max_bugs:
+                return codes
+            code = str(bug.get("BugCode") or "").strip()
+            if code:
+                codes.append(code)
+    return codes
+
+
+def validate_report(report: str, data: dict, max_bugs: int) -> list[str]:
+    """Return completeness errors; an invalid report must not be published."""
+    errors = []
+    if report.count("# Per-Bug Verification") != 1:
+        errors.append("missing or duplicated '# Per-Bug Verification' heading")
+    if report.count("# Recommended Regression Areas") != 1:
+        errors.append("missing or duplicated '# Recommended Regression Areas' heading")
+    missing = [code for code in expected_bug_codes(data, max_bugs) if code not in report]
+    if missing:
+        errors.append(f"missing {len(missing)} BugCode(s): {', '.join(missing)}")
+    regression_parts = re.split(r"^#\s+Recommended Regression Areas\s*$", report,
+                                maxsplit=1, flags=re.I | re.M)
+    if len(regression_parts) == 2:
+        regression = regression_parts[1]
+        if not re.search(r"\b(Critical|High|Medium|Low)\b", regression, flags=re.I):
+            errors.append("regression section has no risk-ranked recommendations")
+        if re.search(r"summary of (?:the )?(?:provided|design|bug)", regression, flags=re.I):
+            errors.append("regression section summarizes inputs instead of recommending tests")
+    return errors
+
+
+def regression_first(report: str) -> str:
+    """Normalize a complete report so recommendations are always the first section."""
+    heading_re = re.compile(
+        r"^#\s+(Recommended Regression Areas|Per-Bug Verification)\s*$",
+        flags=re.I | re.M,
+    )
+    matches = list(heading_re.finditer(report))
+    if len(matches) != 2:
+        return report.strip()
+
+    sections = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(report)
+        sections[match.group(1).lower()] = report[match.end():end].strip()
+
+    regression = sections.get("recommended regression areas")
+    verification = sections.get("per-bug verification")
+    if regression is None or verification is None:
+        return report.strip()
+    return (
+        "# Recommended Regression Areas\n\n"
+        + regression
+        + "\n\n# Per-Bug Verification\n\n"
+        + verification
+    ).strip()
+
+
+def normalize_regression_bullets(report: str) -> str:
+    """Turn unbulleted bold regression recommendations into readable bullets."""
+    parts = re.split(
+        r"(^#\s+Recommended Regression Areas\s*$)",
+        report,
+        maxsplit=1,
+        flags=re.I | re.M,
+    )
+    if len(parts) != 3:
+        return report
+    before, heading, remainder = parts
+    regression_parts = re.split(
+        r"(^#\s+Per-Bug Verification\s*$)",
+        remainder,
+        maxsplit=1,
+        flags=re.I | re.M,
+    )
+    regression = regression_parts[0]
+    regression = re.sub(
+        r"(?m)^(?=\*\*[^*\n]+\*\*\s*[-–—:])",
+        "- ",
+        regression,
+    )
+    return before + heading + regression + "".join(regression_parts[1:])
+
+
+def selected_bugs(data: dict, max_bugs: int) -> list[dict]:
+    selected = []
+    for bugs in data.get("products", {}).values():
+        for bug in bugs:
+            if len(selected) >= max_bugs:
+                return selected
+            selected.append(enrich_from_raw(bug))
+    return selected
+
+
+def build_verification_chunk_prompt(bugs: list[dict], max_log_chars: int) -> str:
+    blocks = "\n\n".join(build_bug_block(bug, max_log_chars) for bug in bugs)
+    return f"""You are a senior QA engineer. Write concise verification checklists for
+the fixed bugs below. For EVERY bug, output a level-2 markdown heading containing
+its exact BugCode, followed by 2-4 numbered, concrete verification steps. Include
+device/locale/content preconditions when supplied. Do not repeat summaries,
+metadata, root-cause text, or code URLs. Do not add a level-1 heading, preamble,
+conclusion, or regression recommendations.
+
+Fixed bugs:
+{blocks}
+"""
+
+
+def build_regression_prompt(data: dict, max_bugs: int, max_log_chars: int) -> str:
+    bugs = selected_bugs(data, max_bugs)
+    # Use a compact cross-bug digest. Full repro logs crowd a local model's
+    # context and cause it to summarize tickets instead of reasoning about
+    # shared code paths and adjacent regression coverage.
+    digest_lines = []
+    for bug in bugs:
+        resolutions = bug.get("Resolutions") or []
+        root_fixes = "; ".join(
+            " / ".join(filter(None, [
+                stringify(r.get("root_cause"), 180),
+                stringify(r.get("solution"), 220),
+            ]))
+            for r in resolutions
+        )
+        digest_lines.append(
+            f"- {bug.get('BugCode')}: "
+            f"{stringify(bug.get('Short Description'), 260)} | "
+            f"root cause/fix: {root_fixes or 'detail unavailable'}"
+        )
+    blocks = "\n".join(digest_lines)
+    return f"""You are a senior QA engineer. Based on the fixed bugs, root causes, and
+solutions below, recommend OTHER app sections that should be regression-tested
+because they share code paths or may have been disturbed. Output exactly one
+level-1 heading: "# Recommended Regression Areas". Group recommendations by
+module, rank them Critical/High/Medium/Low, and format every module/feature as a
+separate markdown bullet. Give concrete test actions plus one-sentence reasoning.
+Do not summarize the tickets, repeat bug details, create
+a ticket table, or discuss design guidelines. Start directly with risk-ranked
+adjacent test areas. Each item must name an app section outside the direct fix,
+state what QA should do, and explain the shared state/component/code-path risk.
+
+Compact fix digest:
+{blocks}
+"""
+
+
+def strip_chunk_wrappers(text: str) -> str:
+    text = re.sub(r"^\s*#\s+Per-Bug Verification\s*", "", text, flags=re.I)
+    # Ignore any unsolicited regression tail; the dedicated synthesis call is
+    # the only source for that section.
+    text = re.split(r"^#\s+Recommended Regression Areas\s*$", text,
+                    maxsplit=1, flags=re.I | re.M)[0]
+    return text.strip()
+
+
+def generate_chunked_report(data: dict, model: str, ollama_url: str,
+                            timeout: int, max_bugs: int,
+                            max_log_chars: int, chunk_size: int = 4) -> str:
+    bugs = selected_bugs(data, max_bugs)
+    verification_parts = []
+    total_chunks = (len(bugs) + chunk_size - 1) // chunk_size
+    for start in range(0, len(bugs), chunk_size):
+        chunk = bugs[start:start + chunk_size]
+        chunk_number = start // chunk_size + 1
+        print(f"  Verification batch {chunk_number}/{total_chunks} "
+              f"({len(chunk)} bugs)…", flush=True)
+        response = call_ollama(
+            build_verification_chunk_prompt(chunk, min(max_log_chars, 800)),
+            model, ollama_url, timeout,
+        )
+        cleaned = strip_chunk_wrappers(response)
+        # Small models occasionally omit one item even in a four-bug batch.
+        # Repair only the missing items with a one-bug call instead of
+        # restarting the entire TR generation.
+        missing_from_chunk = [
+            bug for bug in chunk
+            if str(bug.get("BugCode") or "").strip() not in cleaned
+        ]
+        for missing_bug in missing_from_chunk:
+            code = str(missing_bug.get("BugCode") or "").strip()
+            print(f"    Repairing omitted bug {code}…", flush=True)
+            repair = call_ollama(
+                build_verification_chunk_prompt([missing_bug,], min(max_log_chars, 800)),
+                model, ollama_url, timeout,
+            )
+            cleaned += "\n\n" + strip_chunk_wrappers(repair)
+        verification_parts.append(cleaned)
+
+    print("  Cross-bug regression synthesis…", flush=True)
+    regression = call_ollama(
+        build_regression_prompt(data, max_bugs, max_log_chars),
+        model, ollama_url, timeout,
+    ).strip()
+    if not re.search(r"^#\s+Recommended Regression Areas\s*$", regression,
+                     flags=re.I | re.M):
+        regression = "# Recommended Regression Areas\n\n" + regression
+
+    return regression + "\n\n# Per-Bug Verification\n\n" \
+        + "\n\n".join(verification_parts)
 
 
 def main():
@@ -294,9 +514,12 @@ def main():
         return
 
     print(f"Summarizing {bug_count} fixed bug(s) with {args.model} "
-          f"(prompt: {len(prompt):,} chars)…")
+          f"in bounded batches…")
     try:
-        report = call_ollama(prompt, args.model, args.ollama_url, args.timeout)
+        report = generate_chunked_report(
+            data, args.model, args.ollama_url, args.timeout,
+            args.max_bugs, args.max_log_chars,
+        )
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         print(f"❌ Ollama call failed: {e}")
         print(f"   Is Ollama running at {args.ollama_url}? (ollama serve / ollama pull {args.model})")
@@ -304,6 +527,15 @@ def main():
 
     if not report.strip():
         print("❌ Ollama returned an empty response.")
+        sys.exit(1)
+
+    report = normalize_regression_bullets(regression_first(report))
+    validation_errors = validate_report(report, data, args.max_bugs)
+    if validation_errors:
+        print("❌ Ollama returned an incomplete test-focus report:")
+        for error in validation_errors:
+            print(f"   - {error}")
+        print("   The existing report was not replaced.")
         sys.exit(1)
 
     meta = data.get("meta", {})

@@ -139,6 +139,23 @@ def _ollama_embed(text: str, model: str = "nomic-embed-text") -> "list[float] | 
         return None
 
 
+def _ollama_model_available(model: str) -> bool:
+    """Return whether the requested model/tag is installed in local Ollama."""
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+        requested = model.strip()
+        requested_base = requested.split(":", 1)[0]
+        for entry in payload.get("models", []):
+            installed = str(entry.get("name") or entry.get("model") or "").strip()
+            if installed == requested or installed.split(":", 1)[0] == requested_base:
+                return True
+    except Exception as exc:
+        print(f"  [embed] Could not query Ollama models: {exc}", file=sys.stderr)
+    return False
+
+
 def get_ollama_embeddings(
     texts: "list[str]",
     bug_codes: "list[str]",
@@ -223,8 +240,9 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
             {"role": "user", "content": user_msg},
         ],
         "stream": False,
+        "think": False,
         "keep_alive": "10m",
-        "options": {"temperature": 0.2, "num_predict": 300},
+        "options": {"temperature": 0.2, "num_predict": 50},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/chat",
@@ -284,6 +302,7 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
             "model": model,
             "prompt": gen_prompt,
             "stream": False,
+            "think": False,
             "options": {"temperature": 0.3, "num_predict": 50},
         }).encode()
         gen_req = urllib.request.Request(
@@ -766,8 +785,8 @@ def main():
     parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf")
     parser.add_argument("--model", default="gemma4:e2b-it-q4_K_M",
                         help="Ollama model for cluster label generation (DEPRECATED: use --label-model)")
-    parser.add_argument("--label-model", default="gemma4",
-                        help="Ollama model for cluster label generation (default: gemma4)")
+    parser.add_argument("--label-model", default="gemma4:e2b-it-q4_K_M",
+                        help="Ollama model for cluster label generation")
     parser.add_argument("--embed-model", default="nomic-embed-text",
                         help="Ollama model for bug embeddings (must support /api/embeddings)")
     parser.add_argument("--force",    action="store_true")
@@ -796,6 +815,18 @@ def main():
     label_model = args.label_model
     print(f"Loaded {len(df):,} bugs | provider={args.provider} embed-model={args.embed_model} label-model={label_model}"
           + (" | stratify-severity=ON" if args.stratify_severity else ""))
+
+    # Fail over once, before entering per-module embedding loops. Without this
+    # check a missing model emits repeated HTTP 404s and misleadingly looks as
+    # though Ollama clustering succeeded. TF-IDF remains a supported fallback.
+    if args.provider == "ollama" and not _ollama_model_available(args.embed_model):
+        print(
+            f"\n  ⚠️  Ollama embedding model '{args.embed_model}' is not installed.\n"
+            f"  Install it with: ollama pull {args.embed_model}\n"
+            "  Falling back to TF-IDF clustering for this run.\n",
+            file=sys.stderr,
+        )
+        args.provider = "tfidf"
 
     # ── Relabel-only mode ─────────────────────────────────────────────────────
     if args.relabel:

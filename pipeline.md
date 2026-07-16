@@ -57,6 +57,11 @@ ai_risk_scorer.py                                                     │
 
  bug_heatmap_dashboard.py  ← reads all outputs above; no step in the
                               run order, just start with streamlit run
+
+ process_newest_tr.py      ← newly Close status transitions from ecl_parsed.csv
+       │                     fetches full status logs through the TR n8n webhook
+       └─ tr_reports/<build>/bug_details.json + test_focus_summary.md
+                              shown in the dedicated TR Test Focus tab
 ```
 
 ---
@@ -258,6 +263,43 @@ No command-line changes. Load files from the sidebar. New in v3.0:
 
 - **Step 3 (clusters):** adds an optional "Module entropy CSV" path field. Stratified summaries (`_s12.csv`, `_s34.csv`) load automatically from their default locations.
 - **Step 4 (forecast):** adds an optional "Bug-type predictions CSV" path field (`_by_cluster.csv`).
+
+---
+
+### Newest TR fixed-bug test focus
+
+`refresh_pipeline.sh` now runs this automatically after Release Pulse generation.
+It selects all `TRCreated` bugs in the newest product version—the same cohort eCL
+labels "RD Resolved Bug" in the Testing Request—then derives the dominant Close
+Build# and fetches each bug's full status log through
+`(TR Report) Get Bug Details_v1.json`. Ollama then produces:
+
+The retained `ParentTRCode` values are displayed as **Bug Creation TRs**. They
+identify the parent TRs where the bugs originated and must not be interpreted
+as the Testing Request associated with the displayed Close Build.
+
+- concrete per-bug verification steps;
+- device, locale, content, and setting preconditions;
+- adjacent modules/sections that share likely disturbed code paths, ranked by risk.
+
+The organized source and report are stored per product under
+`data/products/<slug>/tr_reports/<close_build>/`. `tr_reports/latest.json` points
+the **TR Test Focus** dashboard tab to the latest successful report. When a later refresh
+adds fixes to the same build, records are merged by BugCode before regenerating
+the report.
+
+Manual run:
+
+```bash
+python scripts/process_newest_tr.py \
+  --product pdri \
+  --product-dir data/products/pdri \
+  --model gemma4:e2b-it-q4_K_M
+```
+
+Use `./refresh_pipeline.sh --skip-tr-summary` to disable this stage. If no bugs
+changed to Close, the stage exits successfully and leaves the previous report in
+place.
 - **Tab 8 (Bug Clusters):** velocity chart, module entropy chart, and stratified S1/S2 vs S3/S4 tabs are shown when the corresponding files are loaded.
 - **Tab 9 (Defect Forecast):** module forecast cards now show a per-theme breakdown ("~3 bugs — login crash / timeout") under "What to expect."
 
@@ -306,5 +348,5 @@ All v3.0 changes are strictly additive:
 | `compute_risk_scores.py` | ✅ Unchanged |
 | `ai_risk_scorer.py` | ✅ Unchanged |
 | `visual_regression.py` | ✅ Unchanged |
-| `fetch_from_n8n.py` | ✅ Unchanged |
+| `fetch_from_n8n.py` | Clears stale `_status_changed` flags for records omitted by narrow fetches |
 | `parse_ecl_export.py` | ✅ Unchanged |

@@ -30,7 +30,10 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from fetch_from_n8n import PRODUCT_MAP
+try:
+    from fetch_from_n8n import PRODUCT_MAP
+except ModuleNotFoundError:  # Imported as scripts.fetch_tr_bug_details
+    from scripts.fetch_from_n8n import PRODUCT_MAP
 
 DEFAULT_WEBHOOK_URL = (
     "https://ecl-agent.cyberlink.com/webhook/9f21c4d8-3b7a-4a05-8e2f-6d4c1b90a7e3-v1"
@@ -162,7 +165,10 @@ def main():
     for prod, bugs in products.items():
         print(f"   {prod}: {len(bugs)} bug(s)")
     if meta.get("tr_codes"):
-        print(f"   TR codes in this build: {', '.join(meta['tr_codes'])}")
+        print(
+            "   Bug creation/parent TRs (not the Close Build's Testing Request): "
+            f"{', '.join(meta['tr_codes'])}"
+        )
 
     # Coverage: how many bugs carry a parsed RD resolution (root cause / fix)
     all_bugs = [b for bugs in products.values() for b in bugs]
