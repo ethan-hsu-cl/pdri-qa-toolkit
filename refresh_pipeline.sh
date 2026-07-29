@@ -16,6 +16,7 @@
 #   ./refresh_pipeline.sh                                # auto schedule
 #   ./refresh_pipeline.sh --dry-run                      # print steps, don't execute
 #   ./refresh_pipeline.sh --products pdri,phdi           # specific products
+#   ./refresh_pipeline.sh --products all                 # all configured products
 #   ./refresh_pipeline.sh --products pdri --duration-months 1
 #   ./refresh_pipeline.sh --weekday                      # force weekday schedule
 #   ./refresh_pipeline.sh --weekend                      # force weekend (full) schedule
@@ -56,6 +57,7 @@ export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when pip
 # Format: "slug:duration_months slug:duration_months ..."
 WEEKDAY_PRODUCTS="pdri:1 phdi:1"
 WEEKEND_PRODUCTS="pdri:36 phdi:36 pdra:36 phda:36 pdr:36 phd:36 promeo:36 vvg:36"
+ALL_PRODUCT_SLUGS="pdri phdi pdra phda pdr phd promeo vvg"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -187,6 +189,38 @@ run_silent() {
   fi
 }
 
+# Required commands run inside a per-product subshell. Because that subshell is
+# itself evaluated by an `if`, Bash's `set -e` does not stop on nested failures.
+# Exit the product subshell explicitly so later stages cannot run on missing or
+# stale inputs and a failed product cannot be reported as successful.
+run_required() {
+  if ! run "$@"; then
+    log "  ERROR: required command failed; stopping this product."
+    exit 1
+  fi
+}
+
+run_silent_required() {
+  if ! run_silent "$@"; then
+    log "  ERROR: required command failed; stopping this product."
+    exit 1
+  fi
+}
+
+promote_required() {
+  if ! promote "$@"; then
+    log "  ERROR: required output was not promoted; stopping this product."
+    exit 1
+  fi
+}
+
+promote_dir_required() {
+  if ! promote_dir "$@"; then
+    log "  ERROR: required output directory was not promoted; stopping this product."
+    exit 1
+  fi
+}
+
 # Atomically promote a staging file to live data.
 promote() {
   local src="$1" dst="$2"
@@ -310,7 +344,7 @@ run_product_pipeline() {
     unset PDRI_EMBEDDING_MODEL
   fi
 
-  run "python scripts/fetch_from_n8n.py \
+  run_required "python scripts/fetch_from_n8n.py \
     --product '$SLUG' \
     --duration-months '$DURATION' \
     --scope all \
@@ -319,8 +353,8 @@ run_product_pipeline() {
     --parsed-output '$STAGING_PRODUCT/ecl_parsed.csv' \
     --then-parse"
 
-  promote "$STAGING_PRODUCT/ecl_raw.json"    "$DATA_PRODUCT/ecl_raw.json"
-  promote "$STAGING_PRODUCT/ecl_parsed.csv"  "$DATA_PRODUCT/ecl_parsed.csv"
+  promote_required "$STAGING_PRODUCT/ecl_raw.json"    "$DATA_PRODUCT/ecl_raw.json"
+  promote_required "$STAGING_PRODUCT/ecl_parsed.csv"  "$DATA_PRODUCT/ecl_parsed.csv"
 
   [ -f "$STAGING_PRODUCT/version_catalogue.csv" ] && \
     promote "$STAGING_PRODUCT/version_catalogue.csv" "$DATA_PRODUCT/version_catalogue.csv"
@@ -349,11 +383,11 @@ run_product_pipeline() {
   log ""
   log "── [$SLUG] Stage 2: Risk Register ───────────────────────"
 
-  run "python scripts/compute_risk_scores.py \
+  run_required "python scripts/compute_risk_scores.py \
     '$DATA_PRODUCT/ecl_parsed.csv' \
     '$STAGING_PRODUCT/risk_register_all.csv'"
 
-  promote "$STAGING_PRODUCT/risk_register_all.csv" "$DATA_PRODUCT/risk_register_all.csv"
+  promote_required "$STAGING_PRODUCT/risk_register_all.csv" "$DATA_PRODUCT/risk_register_all.csv"
 
   if [ -d "$STAGING_PRODUCT/risk_register_versions" ]; then
     promote_dir "$STAGING_PRODUCT/risk_register_versions" "$DATA_PRODUCT/risk_register_versions"
@@ -379,19 +413,19 @@ run_product_pipeline() {
 
   if $SKIP_OLLAMA; then
     log "  Using heuristic scorer (--skip-ollama)"
-    run "python scripts/ai_risk_scorer.py \
+    run_required "python scripts/ai_risk_scorer.py \
       '$DATA_PRODUCT/risk_register_all.csv' \
       '$STAGING_PRODUCT/risk_register_scored_all.csv' \
       --provider heuristic"
   else
-    run "python scripts/ai_risk_scorer.py \
+    run_required "python scripts/ai_risk_scorer.py \
       '$DATA_PRODUCT/risk_register_all.csv' \
       '$STAGING_PRODUCT/risk_register_scored_all.csv' \
       --provider ollama \
       --model '$OLLAMA_MODEL'"
   fi
 
-  promote "$STAGING_PRODUCT/risk_register_scored_all.csv" "$DATA_PRODUCT/risk_register_scored_all.csv"
+  promote_required "$STAGING_PRODUCT/risk_register_scored_all.csv" "$DATA_PRODUCT/risk_register_scored_all.csv"
   if [ -d "$STAGING_PRODUCT/risk_register_versions" ]; then
     promote_dir "$STAGING_PRODUCT/risk_register_versions" "$DATA_PRODUCT/risk_register_versions"
   fi
@@ -402,7 +436,7 @@ run_product_pipeline() {
   log ""
   log "── [$SLUG] Stage 4: Test Skeletons + Summary ────────────"
 
-  run_silent "python scripts/auto_tag_tests.py \
+  run_silent_required "python scripts/auto_tag_tests.py \
     '$DATA_PRODUCT/risk_register_scored_all.csv' \
     --generate-skeletons tests/generated/$SLUG/ \
     --summary"
@@ -435,7 +469,7 @@ run_product_pipeline() {
       CLUSTER_CMD="$CLUSTER_CMD --relabel"
     fi
 
-    run "$CLUSTER_CMD"
+    run_required "$CLUSTER_CMD"
 
     log "[$SLUG] Stage 5 complete."
   fi
@@ -453,18 +487,18 @@ run_product_pipeline() {
     mkdir -p "$PRED_STAGING"
 
     if $SKIP_OLLAMA; then
-      run "python scripts/predict_defects.py \
+      run_required "python scripts/predict_defects.py \
         '$DATA_PRODUCT/ecl_parsed.csv' \
         '$PRED_STAGING/ecl_parsed_predictions.csv'"
     else
-      run "python scripts/predict_defects.py \
+      run_required "python scripts/predict_defects.py \
         '$DATA_PRODUCT/ecl_parsed.csv' \
         '$PRED_STAGING/ecl_parsed_predictions.csv' \
         --provider ollama \
         --model '$OLLAMA_MODEL'"
     fi
 
-    promote_dir "$PRED_STAGING" "$DATA_PRODUCT/predictions"
+    promote_dir_required "$PRED_STAGING" "$DATA_PRODUCT/predictions"
 
     log "[$SLUG] Stage 6 complete."
   fi
@@ -486,7 +520,7 @@ run_product_pipeline() {
     PULSE_HISTORY_LIVE="$DATA_PRODUCT/predictions/release_pulse_history"
     mkdir -p "$PULSE_STAGING" "$PULSE_HISTORY_STAGING"
 
-    run "python scripts/generate_release_pulse_scenarios.py \
+    run_required "python scripts/generate_release_pulse_scenarios.py \
       '$DATA_PRODUCT' \
       '$PULSE_STAGING/release_pulse_scenarios.json' \
       --provider ollama \
@@ -551,12 +585,24 @@ run_product_pipeline() {
 # ── Determine Active Products ────────────────────────────────────────────────
 resolve_product_schedule() {
   if [ -n "$OVERRIDE_PRODUCTS" ]; then
-    # User override: parse comma-separated slugs, apply override duration or default 36
+    # User override: parse comma-separated slugs, expand "all", validate names,
+    # and apply the override duration (36 months when omitted).
     local dur="${OVERRIDE_DURATION:-36}"
     local products=""
-    IFS=',' read -ra slugs <<< "$OVERRIDE_PRODUCTS"
+    local requested="${OVERRIDE_PRODUCTS// /}"
+    if [ "$requested" = "all" ]; then
+      requested="${ALL_PRODUCT_SLUGS// /,}"
+    elif [[ ",$requested," == *,all,* ]]; then
+      log "ERROR: --products all cannot be combined with other product slugs." >&2
+      return 1
+    fi
+    IFS=',' read -ra slugs <<< "$requested"
     for slug in "${slugs[@]}"; do
       slug="$(echo "$slug" | xargs)"  # trim whitespace
+      if [[ " $ALL_PRODUCT_SLUGS " != *" $slug "* ]]; then
+        log "ERROR: unsupported product '$slug'. Valid values: ${ALL_PRODUCT_SLUGS// /, } or all." >&2
+        return 1
+      fi
       products+="$slug:$dur "
     done
     echo "$products"
@@ -630,6 +676,10 @@ if [ ${#FAILED_PRODUCTS[@]} -gt 0 ]; then
   log ""
   log "⚠️  Products with failures: ${FAILED_PRODUCTS[*]}"
   log "   Re-run with: ./refresh_pipeline.sh --products $(IFS=,; echo "${FAILED_PRODUCTS[*]}") --duration-months $DURATION"
+fi
+PIPELINE_EXIT_CODE=0
+if [ ${#FAILED_PRODUCTS[@]} -gt 0 ]; then
+  PIPELINE_EXIT_CODE=1
 fi
 
 # ── Restart Streamlit ────────────────────────────────────────────────────────
@@ -732,3 +782,8 @@ log "======================================================"
 
 # Prune logs older than 30 days
 find "$LOGS" -name "refresh_*.log" -mtime +30 -delete 2>/dev/null || true
+
+# Preserve multi-product isolation (all products get a chance to run and the
+# dashboard is restarted), but return failure to the shell/cron when any product
+# failed so a partial refresh is never reported as fully successful.
+exit "$PIPELINE_EXIT_CODE"

@@ -143,6 +143,12 @@ Run more than one product:
 ./refresh_pipeline.sh --products pdri,phdi --duration-months 6
 ```
 
+Run all configured products with the same data window:
+
+```bash
+./refresh_pipeline.sh --products all --duration-months 6
+```
+
 Use the automatic weekday/weekend schedule:
 
 ```bash
