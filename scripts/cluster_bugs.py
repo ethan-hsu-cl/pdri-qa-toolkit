@@ -55,6 +55,8 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 
 OLLAMA_BASE            = "http://localhost:11434"
+
+from ollama_compat import extract_json, response_text
 EMBED_CHECKPOINT_EVERY = 50
 VELOCITY_WINDOW        = 2    # versions per velocity comparison window
 MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified cluster pass
@@ -222,14 +224,53 @@ def get_ollama_embeddings(
     return arr
 
 
-def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K_M",
+def _label_from_json(raw: str) -> str:
+    """Read the label out of a {"label": "..."} answer.
+
+    Asking for JSON keeps reasoning models from answering with commentary
+    ("Subtitle glitches (but that\'s a bit broad)"), which no amount of line
+    picking can clean up.
+    """
+    try:
+        obj = extract_json(raw, expect="object")
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("label", "theme", "title", "name"):
+        value = str(obj.get(key) or "").strip().strip('"').strip()
+        if value:
+            return value
+    return ""
+
+
+def _pick_label_line(raw: str, preamble_prefixes: tuple) -> str:
+    """Pick the actual label out of a model answer.
+
+    Reasoning models open with a sentence or two of restatement ("We are given
+    three bug descriptions:") before answering, so the label is the last
+    label-shaped line, not the first non-preamble one.
+    """
+    candidates = []
+    for line in str(raw or "").splitlines():
+        cleaned = line.strip().strip('"\'').strip("*#-•· ").strip()
+        if not cleaned or cleaned.lower().startswith(preamble_prefixes):
+            continue
+        if cleaned.endswith(":") or len(cleaned.split()) > 8:
+            continue  # a heading or a sentence, not a label
+        candidates.append(cleaned)
+    return candidates[-1] if candidates else ""
+
+
+def _ollama_label_cluster(samples: "list[str]", model: str = "qwen3:4b",
                           retries: int = 3) -> str:
     joined = "\n".join(f"- {s}" for s in samples[:8])
     user_msg = (
-        "Given these bug descriptions from the same cluster, "
-        "respond with ONLY a concise 3-6 word label (no punctuation, no quotes) that "
-        "best captures the common theme.\n\n"
-        f"Bug descriptions:\n{joined}\n\nLabel:"
+        "Given these bug descriptions from the same cluster, name the common "
+        "theme in 3-6 words.\n"
+        'Return only JSON: {"label": "<3-6 word theme>"}\n'
+        "No commentary, no caveats, no punctuation inside the label.\n\n"
+        f"Bug descriptions:\n{joined}"
     )
     # Use /api/chat with an explicit system role — some models (e.g. gemma4
     # quantised variants) return empty content when no system message is present.
@@ -241,8 +282,9 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
         ],
         "stream": False,
         "think": False,
+        "format": "json",
         "keep_alive": "10m",
-        "options": {"temperature": 0.2, "num_predict": 50},
+        "options": {"temperature": 0.2, "num_predict": 200},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/chat",
@@ -258,24 +300,16 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode())
                 msg = data.get("message", {})
-                raw = msg.get("content", "").strip()
-                # Some reasoning-enabled models (e.g. gemma4) emit the actual
-                # answer in a "thinking" field and leave "content" empty.
-                if not raw:
-                    raw = msg.get("thinking", "").strip()
+                # Some reasoning-enabled models emit the actual answer in a
+                # "thinking" field, or inline it in <think> tags.
+                raw = response_text(data)
                 if not raw and attempt == 0:
                     print(f"  [label] DEBUG response keys: {list(data.keys())}, "
                           f"message keys: {list(msg.keys())}",
                           file=sys.stderr)
-                label = ""
-                for ln in raw.splitlines():
-                    cleaned = ln.strip().strip('"\'').strip("*#-•· ").strip()
-                    if not cleaned:
-                        continue
-                    if cleaned.lower().startswith(preamble_prefixes):
-                        continue
-                    label = cleaned
-                    break
+                label = _label_from_json(raw) or _pick_label_line(
+                    raw, preamble_prefixes
+                )
                 if label:
                     return label
                 if attempt < retries - 1:
@@ -303,7 +337,7 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
             "prompt": gen_prompt,
             "stream": False,
             "think": False,
-            "options": {"temperature": 0.3, "num_predict": 50},
+            "options": {"temperature": 0.3, "num_predict": 200},
         }).encode()
         gen_req = urllib.request.Request(
             f"{OLLAMA_BASE}/api/generate",
@@ -312,12 +346,11 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
         )
         with urllib.request.urlopen(gen_req, timeout=60) as resp:
             gdata = json.loads(resp.read().decode())
-            fallback_raw = gdata.get("response", "").strip()
-            for ln in fallback_raw.splitlines():
-                cleaned = ln.strip().strip('"\'').strip("*#-•· ").strip()
-                if cleaned and not cleaned.lower().startswith(preamble_prefixes):
-                    print(f"  [label] /api/generate fallback succeeded: {cleaned!r}", file=sys.stderr)
-                    return cleaned
+            fallback_raw = response_text(gdata)
+            cleaned = _pick_label_line(fallback_raw, preamble_prefixes)
+            if cleaned:
+                print(f"  [label] /api/generate fallback succeeded: {cleaned!r}", file=sys.stderr)
+                return cleaned
             print(f"  [label] /api/generate fallback also returned empty.", file=sys.stderr)
     except Exception as e:
         print(f"  [label] /api/generate fallback failed: {e}", file=sys.stderr)
@@ -351,7 +384,7 @@ def cluster_bugs(
     eps=0.7,
     min_samples=3,
     provider="tfidf",
-    model="gemma4",
+    model="qwen3:4b",
     embed_model="nomic-embed-text",
     embed_cache: "dict | None" = None,
     cache_path: "Path | None" = None,
@@ -594,7 +627,7 @@ def cluster_bugs_stratified(df: pd.DataFrame,
                               method: str = "kmeans",
                               n_clusters: int = 15,
                               provider: str = "tfidf",
-                              model: str = "gemma4",
+                              model: str = "qwen3:4b",
                               embed_model: str = "nomic-embed-text",
                               embed_cache: "dict | None" = None,
                               fingerprint: str = "") -> pd.DataFrame:
@@ -783,9 +816,9 @@ def main():
     parser.add_argument("input_csv")
     parser.add_argument("output_csv")
     parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf")
-    parser.add_argument("--model", default="gemma4:e2b-it-q4_K_M",
+    parser.add_argument("--model", default="qwen3:4b",
                         help="Ollama model for cluster label generation (DEPRECATED: use --label-model)")
-    parser.add_argument("--label-model", default="gemma4:e2b-it-q4_K_M",
+    parser.add_argument("--label-model", default="qwen3:4b",
                         help="Ollama model for cluster label generation")
     parser.add_argument("--embed-model", default="nomic-embed-text",
                         help="Ollama model for bug embeddings (must support /api/embeddings)")

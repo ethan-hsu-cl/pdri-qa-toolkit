@@ -8,7 +8,7 @@ the dashboard can detect when a newer version requires regeneration.
 
 Usage:
   python generate_release_pulse_scenarios.py <product_data_dir> <output_json>
-      [--provider ollama|heuristic] [--model gemma4] [--top-n 10]
+      [--provider ollama|heuristic] [--model qwen3:4b] [--top-n 10]
 """
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from pathlib import Path
 import pandas as pd
 
 OLLAMA_BASE = "http://localhost:11434"
+
+from ollama_compat import extract_json, response_text, with_thinking_disabled
 PULSE_STATUSES = {"TRCreated", "RDResolved"}
 RISK_ORDER = ["Low", "Medium", "High", "Critical"]
 
@@ -70,19 +72,22 @@ def call_ollama(model, module, quadrant, risk_level, risk_score,
         f"3. Interaction effects with the known historical risk areas\n\n"
         f"Each scenario must be a concrete, testable statement (like a real bug title). "
         f"Do NOT write vague summaries. Do NOT mention counts.\n"
-        f"Return ONLY a JSON array:\n"
-        f'[{{"scenario": "...", "confidence": "high|medium|low", '
+        # `format: json` makes small models mirror the input structure unless
+        # the wrapper key is named explicitly, so ask for one named object.
+        f"Return exactly this JSON object and nothing else. Do not echo the "
+        f"context above:\n"
+        f'{{"scenarios": [{{"scenario": "...", "confidence": "high|medium|low", '
         f'"based_on": "in_flight|historical|both", '
         f'"explanation": "**Why likely:** [reason]. **Steps to reproduce:** [steps]. '
-        f'**What to verify:** [expected vs actual]."}}]'
+        f'**What to verify:** [expected vs actual]."}}]}}'
     )
-    payload = json.dumps({
+    payload = json.dumps(with_thinking_disabled({
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
         "options": {"temperature": 0.3, "num_predict": 2000},
-    }).encode()
+    })).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
         data=payload,
@@ -91,8 +96,8 @@ def call_ollama(model, module, quadrant, risk_level, risk_score,
     raw_text = ""
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            raw_text = json.loads(resp.read().decode()).get("response", "[]")
-        parsed = json.loads(raw_text)
+            raw_text = response_text(json.loads(resp.read().decode()))
+        parsed = extract_json(raw_text)
         if isinstance(parsed, list):
             return parsed
         if isinstance(parsed, dict):
@@ -101,13 +106,11 @@ def call_ollama(model, module, quadrant, risk_level, risk_score,
                     return parsed[key]
         return []
     except Exception:
-        m = re.search(r'\[.*\]', raw_text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except Exception:
-                return []
-        return []
+        try:
+            salvaged = extract_json(raw_text, expect="array")
+        except Exception:
+            return []
+        return salvaged if isinstance(salvaged, list) else []
 
 
 def score_to_risk(score: float) -> str:
@@ -275,7 +278,7 @@ def main():
     ap.add_argument("product_dir", help="Path to data/products/<slug>/")
     ap.add_argument("output_json", help="Output JSON path")
     ap.add_argument("--provider", choices=["ollama", "heuristic"], default="ollama")
-    ap.add_argument("--model", default="gemma4")
+    ap.add_argument("--model", default="qwen3:4b")
     ap.add_argument("--top-n", type=int, default=10)
     ap.add_argument(
         "--history-dir",

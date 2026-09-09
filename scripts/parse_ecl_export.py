@@ -74,7 +74,9 @@ except ImportError:
 # Ollama semantic matcher — re-ranks rapidfuzz top-K candidates with an LLM.
 # Enabled via env var PDRI_OLLAMA_MATCHER=1 or CLI --ollama-matcher.
 OLLAMA_MATCHER_URL = "http://localhost:11434/api/generate"
-OLLAMA_MATCHER_DEFAULT_MODEL = "gemma4"
+
+from ollama_compat import extract_json, response_text, with_thinking_disabled
+OLLAMA_MATCHER_DEFAULT_MODEL = "qwen3:4b"
 OLLAMA_MATCHER_TIMEOUT = 30
 _OLLAMA_MATCHER_MEM_CACHE: dict[str, dict] = {}
 
@@ -1258,13 +1260,13 @@ def _ollama_disambiguate(raw: str, candidates: list[str], model: str) -> Optiona
         "- When in doubt, return null — a human will review.\n"
         "- confidence should be >=0.9 only when you are certain; otherwise lower.\n"
     )
-    payload = json.dumps({
+    payload = json.dumps(with_thinking_disabled({
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
         "options": {"temperature": 0},
-    }).encode()
+    })).encode()
     req = urllib.request.Request(
         OLLAMA_MATCHER_URL,
         data=payload,
@@ -1273,14 +1275,11 @@ def _ollama_disambiguate(raw: str, candidates: list[str], model: str) -> Optiona
     try:
         resp = urllib.request.urlopen(req, timeout=OLLAMA_MATCHER_TIMEOUT)
         envelope = json.loads(resp.read().decode(errors="replace"))
-        text = envelope.get("response", "").strip()
+        text = response_text(envelope)
         try:
-            obj = json.loads(text)
+            obj = extract_json(text, expect="object")
         except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if not m:
-                return None
-            obj = json.loads(m.group(0))
+            return None
         match = obj.get("match")
         if match is not None:
             match = str(match).strip()

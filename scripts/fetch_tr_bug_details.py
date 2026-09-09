@@ -7,9 +7,9 @@ Calls the "(TR Report) Get Bug Details_v1" n8n workflow, which either:
 then pulls each bug's full record via the eBug "getOldeBug" operation and
 returns everything grouped by product.
 
-Output is saved to data/products/<slug>/tr_reports/<label>/bug_details.json
-where <label> is the sanitized close-build (or manual_<timestamp> when only
---bug-codes is given).
+Default output is saved under
+data/products/<slug>/tr_reports/manual/<timestamp>_<label>/bug_details.json so
+manual fetches cannot overwrite immutable pipeline evidence.
 
 Usage:
     python scripts/fetch_tr_bug_details.py --product pdri --close-build 16.5.0.185409
@@ -17,7 +17,7 @@ Usage:
     python scripts/fetch_tr_bug_details.py --product pdri --bug-codes DRI261853-0005,DRI261853-0002
 
 Next step (AI summary of what to test):
-    python scripts/summarize_tr_bugs.py data/products/pdri/tr_reports/<label>/bug_details.json
+    python scripts/summarize_tr_bugs.py data/products/pdri/tr_reports/manual/<run>/bug_details.json
 """
 
 import argparse
@@ -93,6 +93,12 @@ def normalize_response(data) -> dict:
             f"Unexpected response shape (no 'products' key). "
             f"Got keys: {sorted(data.keys()) if isinstance(data, dict) else type(data)}"
         )
+    if not isinstance(data.get("meta", {}), dict):
+        raise FetchError("Unexpected response shape: 'meta' must be an object.")
+    if not isinstance(data["products"], dict) or any(
+        not isinstance(bugs, list) for bugs in data["products"].values()
+    ):
+        raise FetchError("Unexpected response shape: 'products' must map names to arrays.")
     return data
 
 
@@ -118,7 +124,7 @@ def main():
                         help=f"n8n webhook POST URL (default: {DEFAULT_WEBHOOK_URL})")
     parser.add_argument("--output", "-o", default=None,
                         help="Output JSON path. Default: "
-                             "data/products/<slug>/tr_reports/<label>/bug_details.json")
+                             "data/products/<slug>/tr_reports/manual/<run>/bug_details.json")
     parser.add_argument("--timeout", type=int, default=300,
                         help="HTTP timeout in seconds (default: 300 — detail fetch "
                              "loops one API call per bug, so this can be slow).")
@@ -140,9 +146,12 @@ def main():
     if args.output:
         output_path = Path(args.output)
     else:
-        label = (sanitize_label(args.close_build) if args.close_build
-                 else "manual_" + datetime.now().strftime("%Y%m%d_%H%M"))
-        output_path = Path(f"data/products/{args.product}/tr_reports/{label}/bug_details.json")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        label = sanitize_label(args.close_build or "bug_codes") or "request"
+        output_path = Path(
+            f"data/products/{args.product}/tr_reports/manual/"
+            f"{timestamp}_{label}/bug_details.json"
+        )
 
     print(f"Fetching TR bug details — product={args.product} "
           f"close_build={args.close_build or '-'} "
@@ -158,8 +167,9 @@ def main():
     products = data.get("products", {})
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(output_path)
 
     print(f"\n✅ Saved {meta.get('bug_count', '?')} bug detail(s) → {output_path}")
     for prod, bugs in products.items():

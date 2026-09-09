@@ -59,7 +59,7 @@ Output paths:
 Usage:
   python predict_defects.py <input_csv>
   python predict_defects.py <input_csv> --cluster-csv data/clusters/ecl_parsed_clustered.csv
-  python predict_defects.py <input_csv> --provider ollama --model gemma4
+  python predict_defects.py <input_csv> --provider ollama --model qwen3:4b
   python predict_defects.py <input_csv> --provider claude --api-key <key>
   python predict_defects.py <input_csv> --no-ai
   python predict_defects.py <input_csv> --scored-csv <path>
@@ -128,6 +128,10 @@ PREDICTION_GUIDE = """
 TFIDF_TOP_N  = 40
 TFIDF_PREFIX = "tfidf_"
 OLLAMA_BASE  = "http://localhost:11434"
+
+from ollama_compat import (
+    extract_json, response_text, strip_meta_preamble, with_thinking_disabled,
+)
 
 SCENARIO_TOP_MODULES    = 10
 SCENARIOS_PER_MODULE    = 5
@@ -1481,7 +1485,7 @@ def generate_category_ai_descriptions(
     category_df: pd.DataFrame,
     orig_df: pd.DataFrame,
     provider: str = "none",
-    model: str = "gemma4",
+    model: str = "qwen3:4b",
     max_ai_calls: int = 30,
     mod_col: str = "parsed_module",
     text_col: str = "parsed_description",
@@ -1863,7 +1867,7 @@ def _generate_scenarios_ai_ollama(
     category_distribution: "dict | None" = None,
     cluster_labels: "list | None" = None,
     leading_signal: str = "",
-    model: str = "gemma4",
+    model: str = "qwen3:4b",
 ) -> list:
     """AI scenario generator using Ollama. Returns list of scenario dicts."""
     desc_block = "\n".join(f" - {d}" for d in descriptions[:15]) if descriptions \
@@ -1893,16 +1897,17 @@ def _generate_scenarios_ai_ollama(
         f"  • Do NOT invent failure modes that have no support in the descriptions above. If only N distinct patterns exist, return N scenarios.\n"
         f"  • Do NOT write vague summaries. Do NOT mention counts.\n"
         f"  • confidence: 'high' = matches 2+ recent descriptions; 'medium' = matches 1 recent description; 'low' = extrapolation.\n\n"
-        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "<quoted description from list above>", "explanation": "**Why likely:** [reference the recent pattern]. **Steps to reproduce:** [concrete trigger]. **What to verify:** [expected vs actual]."}}]'
+        f'Return exactly this JSON object and nothing else. Do not echo the context above:\n'
+        f'{{"scenarios": [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "<quoted description from list above>", "explanation": "**Why likely:** [reference the recent pattern]. **Steps to reproduce:** [concrete trigger]. **What to verify:** [expected vs actual]."}}]}}'
     )
 
-    payload = json.dumps({
+    payload = json.dumps(with_thinking_disabled({
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
         "options": {"temperature": 0.2, "num_predict": 2000},
-    }).encode()
+    })).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
         data=payload,
@@ -1911,7 +1916,7 @@ def _generate_scenarios_ai_ollama(
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = json.loads(resp.read().decode())
-            text = raw.get("response", "").strip()
+            text = response_text(raw)
             # Try parsing as JSON directly
             def _normalize_scenarios(lst: list) -> list:
                 """Ensure every element is a dict with at least a 'scenario' key."""
@@ -1924,7 +1929,7 @@ def _generate_scenarios_ai_ollama(
                 return result
 
             try:
-                parsed = json.loads(text)
+                parsed = extract_json(text)
                 if isinstance(parsed, list):
                     return _normalize_scenarios(parsed)
                 # Some models wrap in a dict
@@ -1932,15 +1937,12 @@ def _generate_scenarios_ai_ollama(
                     for key in ("scenarios", "predictions", "bugs", "results"):
                         if key in parsed and isinstance(parsed[key], list):
                             return _normalize_scenarios(parsed[key])
+                    # …or return the array under some other single key.
+                    for value in parsed.values():
+                        if isinstance(value, list) and value:
+                            return _normalize_scenarios(value)
             except json.JSONDecodeError:
                 pass
-            # Fallback: extract JSON array from text
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                try:
-                    return _normalize_scenarios(json.loads(match.group()))
-                except json.JSONDecodeError:
-                    pass
     except Exception:
         pass
     return []
@@ -2103,7 +2105,7 @@ def generate_bug_scenarios(
     category_preds_df: "pd.DataFrame | None",
     cluster_preds_df: "pd.DataFrame | None",
     provider: str = "none",
-    model: str = "gemma4",
+    model: str = "qwen3:4b",
     api_key: str = "",
     mod_col: str = "parsed_module",
     text_col: str = "parsed_description",
@@ -2412,7 +2414,7 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_type,
-                                  leading_signal, descriptions, model="gemma4",
+                                  leading_signal, descriptions, model="qwen3:4b",
                                   cluster_forecast: "dict | None" = None,
                                   category_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
@@ -2451,14 +2453,19 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
         f"file format, or interaction), not generic ('test the feature').\n"
         f"3. Highlights any RECURRING patterns visible across multiple recent descriptions.\n\n"
         f"Do NOT state or estimate a total bug count. Do NOT speculate about modes not supported by the "
-        f"descriptions above. Plain prose only. No bullet points. No headers."
+        f"descriptions above. Plain prose only. No bullet points. No headers.\n"
+        # Free-text tasks let reasoning models narrate their own instructions
+        # into the answer; a single JSON field keeps the briefing clean.
+        f'Return exactly this JSON object and nothing else:\n'
+        f'{{"briefing": "<the 3-5 sentence paragraph>"}}'
     )
-    payload = json.dumps({
+    payload = json.dumps(with_thinking_disabled({
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 350},
-    }).encode()
+        "format": "json",
+        "options": {"temperature": 0.2, "num_predict": 600},
+    })).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
         data=payload,
@@ -2467,7 +2474,17 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = json.loads(resp.read().decode())
-            return raw.get("response", "").strip()
+            text = response_text(raw)
+            try:
+                parsed = extract_json(text, expect="object")
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in ("briefing", "narrative", "summary", "text"):
+                    value = str(parsed.get(key) or "").strip()
+                    if value:
+                        return strip_meta_preamble(value)
+            return strip_meta_preamble(text)
     except Exception as e:
         return f"[Ollama narrative unavailable: {e}]"
 
@@ -2478,7 +2495,7 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
 
 def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
-                            api_key="", provider="none", model="gemma4",
+                            api_key="", provider="none", model="qwen3:4b",
                             cluster_preds_df: "pd.DataFrame | None" = None,
                             category_preds_df: "pd.DataFrame | None" = None,
                             scenario_df: "pd.DataFrame | None" = None) -> str:
@@ -2621,7 +2638,7 @@ def main():
     scored_csv_path  = None
     cluster_csv_path = None
     provider = "claude"
-    model    = "gemma4"
+    model    = "qwen3:4b"
     api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
     ai_scenarios = False
 

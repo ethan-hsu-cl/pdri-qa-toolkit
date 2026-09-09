@@ -26,7 +26,8 @@
 #   ./refresh_pipeline.sh --skip-pulse-scenarios         # skip Release Pulse AI synthesis
 #   ./refresh_pipeline.sh --skip-tr-summary              # skip newest-TR fixed-bug report
 #   ./refresh_pipeline.sh --force-relabel                # re-run cluster labels only (no re-embedding)
-#   ./refresh_pipeline.sh --ollama-model gemma4:e2b-it-q4_K_M     # AI risk scorer model
+#   ./refresh_pipeline.sh --ollama-model qwen3:4b                 # AI risk scorer model
+#   ./refresh_pipeline.sh --tr-model qwen3:4b                     # TR Test Focus model
 #   ./refresh_pipeline.sh --embed-model nomic-embed-text           # default embed model
 #   ./refresh_pipeline.sh --embed-model mxbai-embed-large          # alternative embed model
 #
@@ -47,9 +48,14 @@ STAGING="$SCRIPT_DIR/data/staging"
 LOGS="$SCRIPT_DIR/logs"
 LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
 LOCK_FILE="$SCRIPT_DIR/.pipeline.lock"
-OLLAMA_MODEL="gemma4:e2b-it-q4_K_M"
+OLLAMA_MODEL="qwen3:4b"
+# The TR Test Focus stage asks one model to propose grounded predictions and
+# then adversarially audit them against long rulebook prompts, which a 2B-class
+# model cannot hold. It is kept separate from OLLAMA_MODEL so the risk scorer
+# and cluster labeller keep their tuned model.
+TR_MODEL="qwen3:4b"
 EMBED_MODEL="nomic-embed-text"
-CLUSTER_LABEL_MODEL="gemma4:e2b-it-q4_K_M"
+CLUSTER_LABEL_MODEL="qwen3:4b"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
 
@@ -93,6 +99,8 @@ for arg in "$@"; do
     --duration-months)          ;; # value comes in next arg
     --ollama-model=*)           OLLAMA_MODEL="${arg#*=}" ;;
     --ollama-model)             ;; # value comes in next arg
+    --tr-model=*)               TR_MODEL="${arg#*=}" ;;
+    --tr-model)                 ;; # value comes in next arg
     --ollama-matcher-model=*)   OLLAMA_MATCHER_MODEL="${arg#*=}" ;;
     --ollama-matcher-model)     ;; # value comes in next arg
     --embed-model=*)            EMBED_MODEL="${arg#*=}" ;;
@@ -121,6 +129,12 @@ while [[ $# -gt 0 ]]; do
     --ollama-model)
       if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
         OLLAMA_MODEL="$2"
+        shift
+      fi
+      ;;
+    --tr-model)
+      if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+        TR_MODEL="$2"
         shift
       fi
       ;;
@@ -570,7 +584,7 @@ run_product_pipeline() {
     if run "python scripts/process_newest_tr.py \\
       --product '$SLUG' \\
       --product-dir '$DATA_PRODUCT' \\
-      --model '$OLLAMA_MODEL'"; then
+      --model '$TR_MODEL'"; then
       log "[$SLUG] Stage 8 complete."
     else
       # A detail-service outage should not discard the successful core refresh.
@@ -634,7 +648,7 @@ resolve_product_schedule() {
 
 log "======================================================"
 log "QA Daily Refresh  $(date '+%Y-%m-%d %H:%M:%S')"
-log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_ollama_matcher=$SKIP_OLLAMA_MATCHER  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  skip_pulse_scenarios=$SKIP_PULSE_SCENARIOS  skip_tr_summary=$SKIP_TR_SUMMARY  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  ollama_matcher_model=${OLLAMA_MATCHER_MODEL:-<inherit>}  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
+log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_ollama_matcher=$SKIP_OLLAMA_MATCHER  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  skip_pulse_scenarios=$SKIP_PULSE_SCENARIOS  skip_tr_summary=$SKIP_TR_SUMMARY  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  tr_model=$TR_MODEL  ollama_matcher_model=${OLLAMA_MATCHER_MODEL:-<inherit>}  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
 log "======================================================"
 
 # 1. Make sure Streamlit is up before we do anything

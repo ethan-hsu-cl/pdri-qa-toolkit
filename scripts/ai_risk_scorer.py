@@ -15,7 +15,7 @@ No extra arguments needed.
 
 Usage:
   python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider heuristic
-  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model gemma4
+  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model qwen3:4b
   python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --verbose
 """
 import warnings
@@ -23,6 +23,8 @@ warnings.filterwarnings("ignore", message="urllib3.*OpenSSL")
 warnings.filterwarnings("ignore", message="urllib3.*LibreSSL")
 
 import os, json, re, argparse, time, glob, sys
+
+from ollama_compat import extract_json, with_thinking_disabled
 import pandas as pd, numpy as np
 import urllib.request
 from tqdm import tqdm
@@ -76,7 +78,7 @@ def score_heuristic(row):
     return impact, detect, "heuristic", reasoning
 
 
-def score_ollama(row, model="gemma4"):
+def score_ollama(row, model="qwen3:4b"):
     mod = row.get("module", "Unknown")
     crit = float(row.get('critical_count', 0) or 0)
     total = float(row.get('total_bugs', 0) or 0)
@@ -112,12 +114,12 @@ def score_ollama(row, model="gemma4"):
         f"RegressionRate: {row.get('regression_rate', 0):.3f}\n"
         f"AutomationCatchRate: {row.get('automation_catch_rate', 0):.3f}\n"
     )
-    payload = json.dumps({
+    payload = json.dumps(with_thinking_disabled({
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
-    }).encode()
+    })).encode()
     req = urllib.request.Request(
         "http://localhost:11434/api/generate",
         data=payload,
@@ -127,14 +129,8 @@ def score_ollama(row, model="gemma4"):
         resp = urllib.request.urlopen(req, timeout=120)
         raw = resp.read().decode(errors="replace")
         envelope = json.loads(raw)
-        text = envelope.get("response", "").strip()
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if not m:
-                raise
-            obj = json.loads(m.group(0))
+        text = envelope.get("response", "") or envelope.get("thinking", "")
+        obj = extract_json(text, expect="object")
         impact = int(obj.get("impact", 3))
         detect = int(obj.get("detectability", 3))
         reason = str(obj.get("reasoning", ""))
@@ -368,7 +364,7 @@ def main():
     p.add_argument("input_csv")
     p.add_argument("output_csv")
     p.add_argument("--provider", choices=["heuristic", "ollama", "openai"], default="heuristic")
-    p.add_argument("--model", default="gemma4")
+    p.add_argument("--model", default="qwen3:4b")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print full AI reasoning per module during scoring")
     a = p.parse_args()
