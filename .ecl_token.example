@@ -1,0 +1,34 @@
+# eCL API token — template. THIS FILE IS TRACKED IN GIT; the real one is not.
+#
+#   cp .ecl_token.example .ecl_token
+#   chmod 600 .ecl_token
+#   # then replace the placeholder line at the bottom with your token
+#
+# Where to get it
+# ---------------
+# Self-service, no approval needed: open
+#
+#     https://ecl.cyberlink.com/sso/mgm/tokenPage
+#
+# and issue a personal API token. The same token works for every TR / eBug
+# endpoint. No VPN required — ecl.cyberlink.com is reachable externally, but
+# you do have to pass eCL SSO login. (The Client ID / Secret you request from
+# Jeffy Chuang are a different thing entirely: those are for the eCL *MCP*
+# connector, not for this REST token.)
+#
+# How it is found
+# ---------------
+# $ECL_TOKEN  >  $ECL_TOKEN_FILE  >  this directory's .ecl_token  >  ~/.ecl_token
+#
+# A token here rather than only in ~ means the Jenkins user on the Mac Mini
+# reads the same credential as an interactive run, with no second copy.
+#
+# Handle with care
+# ----------------
+# Query endpoints have NO permission filtering (guide 3-5): a valid token
+# reads every ticket in scope — roughly 242,000 eBugs — including ones you
+# could not open in the eCL web UI. It is not equivalent to your web login.
+# Do not commit it, paste it into Slack / Teams, or copy it into a shared doc.
+#
+# Blank lines and #-comments are ignored, so the token is the first real line:
+PASTE_YOUR_ECL_TOKEN_HERE

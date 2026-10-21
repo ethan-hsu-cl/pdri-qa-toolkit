@@ -85,3 +85,9 @@ visual_results/
 
 # Pipeline lock
 .pipeline.lock
+# ECL API token (real file is local-only; .ecl_token.example is tracked)
+.ecl_token
+
+# Machine-local AT repo folders (set from the TR Test Focus tab)
+.at_repos.json
+.at_repos.tmp

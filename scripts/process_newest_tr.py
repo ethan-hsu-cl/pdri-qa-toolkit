@@ -69,6 +69,14 @@ except ModuleNotFoundError:  # Imported as scripts.process_newest_tr in tests/to
         resolve_threshold_for_category,
     )
 
+try:  # Optional: the vendored IF3 client may not be present on every machine.
+    try:
+        import ecl_direct
+    except ModuleNotFoundError:
+        from scripts import ecl_direct
+except ModuleNotFoundError:
+    ecl_direct = None
+
 MANIFEST_SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
 DEFAULT_FEATURE_MATCH_THRESHOLD = 0.24
@@ -267,18 +275,35 @@ def select_newest_tr_cohort(parsed_csv: Path) -> tuple[str, list[str]]:
         version_counts, key=lambda value: (version_counts[value], value)
     ) if version_counts else ""
 
+    # Membership is every bug closed to this build, whatever its status now.
+    # The build is chosen from TRCreated rows above, but membership must not be:
+    # a bug goes TRCreated -> Close as QA verifies it, so filtering membership on
+    # TRCreated shrinks the report as verification progresses. Measured on pdri
+    # 2026-09-16, build 16.8.0.189063 had 26 bugs closed into it and the report
+    # carried 20; the six lost were all Close, and took the whole Creator Music
+    # module — and two RD "Please verify all languages" notes — out of the report.
+    #
+    # The outlier rule stays scoped to TRCreated rows. Widened, it matches any
+    # same-version row whose build is in another "family", and an *empty* build
+    # is another family: on the same data that pulled in 43 NewCreated/Assigned/
+    # Won't Fix bugs that were never fixed into any build at all.
     cohort_codes = []
-    for row in tr_rows:
+    for row in rows:
+        code = str(row.get("BugCode") or "").strip()
+        if not code:
+            continue
         build = str(row.get("Close Build#") or "").strip()
         version = str(row.get("parsed_version") or "").strip()
         in_build = build == close_build
         is_outlier = (
-            bool(cohort_version)
+            str(row.get("Status") or "").strip().lower() == "trcreated"
+            and usable_build(build)
+            and bool(cohort_version)
             and version == cohort_version
             and close_build_family(build) != dominant_family
         )
         if in_build or is_outlier:
-            cohort_codes.append(str(row.get("BugCode") or "").strip())
+            cohort_codes.append(code)
     return close_build, list(dict.fromkeys(cohort_codes))
 
 
@@ -769,7 +794,14 @@ def resolve_prior_scoreable_analysis(
 
 def write_attempt_status(report_root: Path, product: str, outcome: str,
                          *, close_build: str = "", bug_codes: list[str] | None = None,
-                         message: str = "", latest_success: str = "") -> None:
+                         message: str = "", latest_success: str = "",
+                         build_trs: list[dict] | None = None) -> None:
+    extra = {}
+    if build_trs:
+        # The Close Build's own TR, looked up on every attempt. An unchanged
+        # run never rewrites its promoted details, so this is the only place a
+        # lookup newer than the run can reach the dashboard.
+        extra["build_trs"] = build_trs
     write_json(report_root / "status.json", {
         "schema_version": STATUS_SCHEMA_VERSION,
         "product": product,
@@ -779,6 +811,7 @@ def write_attempt_status(report_root: Path, product: str, outcome: str,
         "selected_bug_codes": bug_codes or [],
         "message": _status_message(message),
         "latest_success_generated_at": latest_success or None,
+        **extra,
     })
 
 
@@ -877,6 +910,7 @@ def structured_prediction_errors(analysis: dict) -> list[str]:
     deterministic_shared_path_support_basis = None
     deterministic_scenario_specificity_basis = None
     deterministic_evidence_ref_completion = None
+    deterministic_generalization_support_basis = None
     published_recommendation_limit = 8
     deterministic_target_category_basis = None
     deterministic_checklist_grounding = None
@@ -1185,6 +1219,16 @@ def structured_prediction_errors(analysis: dict) -> list[str]:
                 deterministic_evidence_ref_completion as _ref_completion,
             )
         deterministic_evidence_ref_completion = _ref_completion
+    if schema_version >= 40:
+        try:
+            from summarize_tr_bugs import (
+                deterministic_generalization_support_basis as _generalization,
+            )
+        except ModuleNotFoundError:
+            from scripts.summarize_tr_bugs import (
+                deterministic_generalization_support_basis as _generalization,
+            )
+        deterministic_generalization_support_basis = _generalization
     if schema_version >= 27:
         raw_target_alias_policy = analysis.get("target_alias_policy")
         expected_target_alias_policy = compact_target_alias_policy(
@@ -1315,6 +1359,32 @@ def structured_prediction_errors(analysis: dict) -> list[str]:
         if item.get("adjacency_support_basis") != expected:
             errors.append(f"{label} adjacency support provenance mismatch")
         combined_supported = expected.get("supported") is True
+        if schema_version >= 40 and item.get("generalization_target_override"):
+            # Schema 40 applies the stated-family override at the deterministic
+            # gate, not only after the model critic, so a published claim may
+            # legitimately fail the lexical target test. Recompute the override
+            # here rather than trusting the flag: it substitutes for the target
+            # half only, and the shared-path half below still has to hold.
+            if deterministic_generalization_support_basis is None:
+                errors.append(
+                    f"{label} generalization support validator is unavailable"
+                )
+                return
+            expected_generalization = (
+                deterministic_generalization_support_basis(
+                    str(item.get("area") or ""),
+                    str(item.get("trigger") or ""),
+                    str(item.get("rationale") or ""),
+                    refs,
+                )
+            )
+            if expected_generalization.get("supported") is not True:
+                errors.append(
+                    f"{label} claims a stated-family target override the "
+                    "cited evidence does not support"
+                )
+            else:
+                combined_supported = True
         if schema_version >= 29:
             if deterministic_shared_path_support_basis is None:
                 errors.append(f"{label} shared-path support validator is unavailable")
@@ -1379,6 +1449,14 @@ def structured_prediction_errors(analysis: dict) -> list[str]:
                 original_refs,
                 confidence_evidence_map,
                 max_refs=4,
+                # Schema 40 added the generalization-family scan, which reads
+                # the claim's trigger and rationale. Withholding both below 40
+                # reproduces the older basis shape exactly, so reports written
+                # before it still revalidate as prior-prediction baselines.
+                **({
+                    "trigger": str(item.get("trigger") or ""),
+                    "rationale": str(item.get("rationale") or ""),
+                } if schema_version >= 40 else {}),
             )
         )
         if completion != expected_completion or refs != expected_refs:
@@ -4504,6 +4582,171 @@ def threshold_audit_candidates(
     return candidates[:1]
 
 
+def withheld_prior_drafts(prior_analysis: dict) -> list[dict]:
+    """Return the prior report's declined drafts with the gate that stopped each.
+
+    Both withholding stages are collected: the deterministic adjacency gate
+    (which records the full candidate under "candidate") and the model critic
+    (which records the claim fields inline).
+    """
+    audit = prior_analysis.get("candidate_grounding_audit")
+    if not isinstance(audit, dict):
+        return []
+    drafts = []
+    discovery = audit.get("candidate_discovery_audit")
+    if isinstance(discovery, dict):
+        for record in discovery.get("adjacency_gate_withheld_candidates") or []:
+            if not isinstance(record, dict):
+                continue
+            claim = record.get("candidate")
+            claim = claim if isinstance(claim, dict) else record
+            drafts.append({
+                "candidate_id": str(record.get("candidate_id") or ""),
+                "stage": "deterministic_evidence_gate",
+                "reason": str(record.get("reason") or ""),
+                "failed_checks": [
+                    str(check) for check in record.get("failed_checks") or []
+                ],
+                "claim": claim,
+            })
+    for record in audit.get("withheld_candidates") or []:
+        if not isinstance(record, dict):
+            continue
+        drafts.append({
+            "candidate_id": str(record.get("candidate_id") or ""),
+            "stage": "model_grounding_audit",
+            "reason": str(record.get("reason") or ""),
+            "failed_checks": [
+                str(check) for check in record.get("failed_checks") or []
+            ],
+            "claim": record,
+        })
+    return drafts
+
+
+def evaluate_withheld_prior_drafts(
+    prior_analysis: dict, observed: dict, observed_bugs: dict, *,
+    feature_match_threshold: float,
+    category_thresholds: dict | None = None,
+) -> dict:
+    """Ask whether the gates declined drafts in categories that then had bugs.
+
+    Published predictions answer "was the claim right". This answers a
+    different and, for a report that publishes nothing, the only available
+    question: "was the bar too high". A build whose entire regression section
+    was withheld still leaves evidence about the gates that withheld it, and
+    discarding that left the retrospective permanently at 0 of 0 — unable to
+    report even that five drafts had been declined in the one category the next
+    build produced a bug in.
+
+    These are not predictions and are never counted as such. A category overlap
+    here is not a miss: the area may be wrong even when the category matches,
+    which is why each row keeps the gate and check that stopped it, so a
+    pattern points at a specific rule rather than at the gates in general.
+    """
+    drafts = withheld_prior_drafts(prior_analysis)
+    rows = []
+    category_evaluable = 0
+    overlap_count = 0
+    feature_candidate_count = 0
+    for draft in drafts:
+        claim = draft["claim"]
+        target = str(claim.get("target_category") or "").strip()
+        scenario_evaluable = not scenario_evaluation_reasons(claim)
+        matched_codes: list[str] = []
+        feature_candidates: list[dict] = []
+        if not target or target == "Cross-cutting / unknown":
+            result = "unscorable_cross_cutting"
+        else:
+            category_evaluable += 1
+            matched_codes = list(observed.get(target, []))
+            if not matched_codes:
+                result = "not_observed_in_current_cohort"
+            else:
+                overlap_count += 1
+                if not scenario_evaluable:
+                    result = "category_overlap_insufficient_prediction_detail"
+                else:
+                    threshold_info = (
+                        (category_thresholds or {}).get(target)
+                        if isinstance(category_thresholds, dict) else None
+                    )
+                    try:
+                        threshold = float(
+                            (threshold_info or {}).get(
+                                "threshold", feature_match_threshold
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        threshold = float(feature_match_threshold)
+                    feature_candidates = feature_match_candidates(
+                        claim, observed_bugs.get(target, []),
+                        threshold=threshold,
+                    )
+                    if feature_candidates:
+                        feature_candidate_count += 1
+                        result = "feature_match_candidate"
+                    else:
+                        result = "category_overlap"
+        rows.append({
+            "candidate_id": draft["candidate_id"],
+            "stage": draft["stage"],
+            "withheld_reason": draft["reason"],
+            "failed_checks": draft["failed_checks"],
+            "area": str(claim.get("area") or ""),
+            "target_category": target,
+            "trigger": str(claim.get("trigger") or ""),
+            "expected_failure_mode": str(
+                claim.get("expected_failure_mode") or ""
+            ),
+            "result": result,
+            "observed_bug_codes": matched_codes,
+            "feature_match_candidates": feature_candidates,
+        })
+    overlap_rows = [
+        row for row in rows if row["result"] in {
+            "category_overlap", "feature_match_candidate",
+            "category_overlap_insufficient_prediction_detail",
+        }
+    ]
+    return {
+        "schema_version": 1,
+        "policy": "withheld_draft_gate_retrospective_v1",
+        "is_prediction_scoring": False,
+        "purpose": "gate_tuning_signal",
+        "limitation": (
+            "These drafts were declined, not predicted. A category overlap "
+            "shows the gate stopped a draft in a category that went on to "
+            "produce a bug; it does not show the draft was right, and the "
+            "predicted area is often not the area that failed. Read it as a "
+            "pointer to the named check, not as a miss."
+        ),
+        "withheld_draft_count": len(rows),
+        "category_evaluable_count": category_evaluable,
+        "category_overlap_count": overlap_count,
+        "feature_candidate_count": feature_candidate_count,
+        # Several drafts routinely name the same area. Counting rows would
+        # report five findings where the gate stopped two distinct places.
+        "distinct_withheld_areas": sorted({
+            row["area"] for row in rows if row["area"]
+        }, key=casefold_order),
+        "distinct_overlap_areas": sorted({
+            row["area"] for row in overlap_rows if row["area"]
+        }, key=casefold_order),
+        "withheld_reason_counts": dict(sorted(Counter(
+            row["withheld_reason"] for row in rows if row["withheld_reason"]
+        ).items())),
+        "overlap_reason_counts": dict(sorted(Counter(
+            row["withheld_reason"] for row in overlap_rows
+            if row["withheld_reason"]
+        ).items())),
+        "overlap_failed_check_counts": dict(sorted(Counter(
+            check for row in overlap_rows for check in row["failed_checks"]
+        ).items())),
+        "drafts": rows,
+    }
+
+
 def evaluate_prior_hypotheses(prior_analysis: dict, current_details: dict, *,
                               prior_close_build: str,
                               current_close_build: str,
@@ -4942,6 +5185,13 @@ def evaluate_prior_hypotheses(prior_analysis: dict, current_details: dict, *,
         "category_thresholds": category_thresholds or {},
         "observed_categories": sorted(observed, key=casefold_order),
         "hypotheses": hypotheses,
+        # Separate cohort, separate question, never folded into the counts
+        # above: a declined draft is not a prediction.
+        "withheld_draft_retrospective": evaluate_withheld_prior_drafts(
+            prior_analysis, observed, observed_bugs,
+            feature_match_threshold=feature_match_threshold,
+            category_thresholds=category_thresholds,
+        ),
     }
 
 
@@ -5085,6 +5335,16 @@ def main() -> int:
     parser.add_argument("--summary-timeout", type=int, default=600)
     parser.add_argument("--safety-limit", type=int, default=500,
                         help="Fail safely when a cohort exceeds this size (default: 500)")
+    parser.add_argument("--no-ecl-direct", action="store_true",
+                        help="Do not use IF3 REST at all: no detail backfill, no "
+                             "TR context, no cohort audit. Without a token these "
+                             "are skipped anyway, so this forces the n8n-only "
+                             "path on a machine that has one.")
+    parser.add_argument("--ecl-complete-cohort", action="store_true",
+                        help="Add bugs the cohort audit finds missing into the "
+                             "cohort instead of only reporting them. Off by "
+                             "default: this changes which bugs the report "
+                             "certifies, so it is a deliberate choice.")
     args = parser.parse_args()
 
     product_dir = Path(args.product_dir or f"data/products/{args.product}")
@@ -5164,6 +5424,48 @@ def main() -> int:
 
     usable, degraded = response_detail_codes(incoming, expected_product)
     missing = [code for code in bug_codes if code not in usable]
+
+    # n8n has spent its retries on these codes. IF3 REST reads the same
+    # getOldeBug record over a different transport, so its failures are
+    # uncorrelated with n8n's — a bug that would otherwise enter the report as
+    # a summary-only stub usually comes back whole here. Recovery is recorded
+    # in meta so a reader can tell which evidence took the second path.
+    if not args.no_ecl_direct and ecl_direct is not None:
+        token_state = ecl_direct.token_status()
+        for warning in token_state["warnings"]:
+            print(f"WARNING: {warning}")
+        if token_state["available"]:
+            print(f"[{args.product}] IF3 direct access enabled "
+                  f"(token from {token_state['source']})")
+
+    recovered_codes: list[str] = []
+    direct_errors: list[str] = []
+    if missing and not args.no_ecl_direct and ecl_direct is not None:
+        print(f"[{args.product}] n8n is missing {len(missing)} bug detail(s); "
+              f"trying IF3 REST directly")
+        direct_records, direct_errors = ecl_direct.fetch_bug_records(
+            missing, expected_product
+        )
+        for message in direct_errors:
+            print(f"  IF3: {message}")
+        if direct_records:
+            incoming = merge_detail_data(incoming, {
+                # merge_detail_data replaces meta["errors"] with the incoming
+                # side's, so carry n8n's forward or they are lost here.
+                "meta": {"errors": list(incoming.get("meta", {}).get("errors", []))},
+                "products": {expected_product: direct_records},
+            })
+            usable, degraded = response_detail_codes(incoming, expected_product)
+            recovered_codes = [code for code in missing if code in usable]
+            missing = [code for code in bug_codes if code not in usable]
+            print(f"[{args.product}] IF3 recovered {len(recovered_codes)} "
+                  f"bug detail(s): {', '.join(recovered_codes) or '-'}")
+    if recovered_codes or direct_errors:
+        incoming.setdefault("meta", {})["ecl_direct_backfill"] = {
+            "recovered_bug_codes": recovered_codes,
+            "errors": direct_errors,
+        }
+
     if missing:
         print(f"WARNING: n8n did not return {len(missing)} requested bug detail(s): "
               f"{', '.join(missing)}. Using parsed-list fallback.")
@@ -5202,6 +5504,104 @@ def main() -> int:
         merge_detail_data(existing, incoming), bug_codes,
         expected_product=expected_product,
     )
+
+    # The cohort above is a Close Build reconstructed from the parsed CSV,
+    # which has no ParentTRCode column. One Close Build bundles many Testing
+    # Requests, so read the real TR records and eCL's own TR-to-eBug relation,
+    # then check the reconstruction against it.
+    if not args.no_ecl_direct and ecl_direct is not None:
+        tr_codes = list(details.get("meta", {}).get("tr_codes") or [])
+        if tr_codes:
+            print(f"[{args.product}] Reading {len(tr_codes)} Testing Request(s) "
+                  f"from IF3 for cohort context")
+            tr_contexts, tr_errors = ecl_direct.fetch_tr_context(tr_codes)
+            for message in tr_errors:
+                print(f"  IF3 TR: {message}")
+            if tr_contexts:
+                details["meta"]["tr_context"] = {
+                    "schema_version": 1,
+                    "source": "IF3 REST (TR.SP.GetOldTRData, TSR.eBugByTR, "
+                              "TSR.AttachedEBug)",
+                    "testing_requests": tr_contexts,
+                    "errors": tr_errors,
+                }
+                audit = ecl_direct.audit_cohort_completeness(
+                    tr_contexts, bug_codes, close_build, expected_product,
+                )
+                details["meta"]["cohort_audit"] = audit
+                found = audit["missing_from_cohort"]
+                if found:
+                    print(f"[{args.product}] COHORT GAP: {len(found)} bug(s) are "
+                          f"TRCreated on this build in eCL but absent from the "
+                          f"parsed cohort: "
+                          f"{', '.join(item['bug_code'] for item in found)}")
+                    if args.ecl_complete_cohort:
+                        bug_codes = list(dict.fromkeys(
+                            bug_codes + [item["bug_code"] for item in found]
+                        ))
+                        print(f"[{args.product}] Expanding cohort to "
+                              f"{len(bug_codes)} bug(s) and refetching detail")
+                        extra_records, extra_errors = ecl_direct.fetch_bug_records(
+                            [item["bug_code"] for item in found], expected_product
+                        )
+                        for message in extra_errors:
+                            print(f"  IF3: {message}")
+                        details = filter_detail_data(
+                            merge_detail_data(details, {
+                                "meta": {"errors": list(
+                                    details.get("meta", {}).get("errors", []))},
+                                "products": {expected_product: extra_records},
+                            }),
+                            bug_codes, expected_product=expected_product,
+                        )
+                    else:
+                        print(f"[{args.product}] Reporting only; re-run with "
+                              f"--ecl-complete-cohort to include them.")
+                elif audit["candidates_considered"]:
+                    print(f"[{args.product}] Cohort audit: complete "
+                          f"({audit['candidates_considered']} candidate(s) "
+                          f"checked and correctly excluded)")
+
+    # The TRs above are where each bug was reported; none of them tests this
+    # build. The one that does is found by its TRBuild. Like tr_context it is
+    # evidence for a human reader, outside analysis_source_hash.
+    build_trs: list[dict] = []
+    # merge_detail_data carries the prior run's meta forward, and that run may
+    # be a different build; a failed lookup must not inherit its TR.
+    details.get("meta", {}).pop("build_trs", None)
+    if not args.no_ecl_direct and ecl_direct is not None:
+        build_trs, build_tr_errors = ecl_direct.find_build_trs(
+            close_build, expected_product)
+        for message in build_tr_errors:
+            print(f"  IF3 build TR: {message}")
+        if build_trs:
+            details.setdefault("meta", {})["build_trs"] = build_trs
+            print(f"[{args.product}] Close Build {close_build} is tested by "
+                  f"{', '.join(tr['tr_code'] for tr in build_trs)}")
+            for tr in build_trs:
+                if tr.get("bugs_loaded"):
+                    print(f"  {tr['tr_code']}: created from "
+                          f"{len(tr['bugs_attached_for_verify'])} bug(s), "
+                          f"generated {len(tr['bugs_found_on_tr'])}")
+
+    # Fixes closed into earlier builds of this version ship in this build too.
+    # Evidence for the focus list's regression section; like tr_context it is
+    # not part of analysis_source_hash and never reaches the model.
+    try:
+        try:
+            from tr_focus_view import collect_version_fixes
+        except ImportError:
+            from scripts.tr_focus_view import collect_version_fixes
+        with parsed_csv.open(newline="", encoding="utf-8-sig") as handle:
+            version_fixes = collect_version_fixes(
+                list(csv.DictReader(handle)), close_build, bug_codes)
+        if version_fixes:
+            details.setdefault("meta", {})["version_fixes"] = version_fixes
+            print(f"[{args.product}] {len(version_fixes['bugs'])} earlier "
+                  f"{version_fixes['version']} fix(es) listed for regression")
+    except (OSError, csv.Error) as exc:
+        print(f"WARNING: earlier fixes in this version unavailable: {exc}")
+
     review_ledger = None
     historical_analog_threshold_policy = None
     analysis_guardrail_policy = None
@@ -5281,6 +5681,7 @@ def main() -> int:
             close_build=close_build, bug_codes=bug_codes,
             message="Evidence, model, and analysis schema are unchanged.",
             latest_success=latest_success,
+            build_trs=build_trs,
         )
         return 0
 
@@ -5375,6 +5776,14 @@ def main() -> int:
                         for item in prior_analysis.get("recommendations") or []
                         if isinstance(item, dict)
                     }
+                    # The withheld-draft retrospective scores by the same
+                    # matcher, so it needs the same per-category thresholds —
+                    # and when the prior report published nothing, these are
+                    # the only categories there are.
+                    prior_categories |= {
+                        str(draft["claim"].get("target_category") or "").strip()
+                        for draft in withheld_prior_drafts(prior_analysis)
+                    }
                     category_thresholds = {
                         category: resolve_threshold_for_category(
                             threshold_calibration, category
@@ -5399,28 +5808,43 @@ def main() -> int:
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             print(f"WARNING: could not evaluate prior TR hypotheses: {exc}")
 
+    generated_at_hint = str(
+        analysis.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    )
+    # The focus list is derived entirely from the two artifacts above, so it is
+    # written here rather than asked of the model: it is what QA reads first
+    # thing after an overnight run, and it must not be able to fail or drift.
+    stage_focus = stage_dir / "focus_list.md"
+    try:
+        try:
+            from tr_focus_view import build_focus_list, focus_list_markdown
+        except ModuleNotFoundError:
+            from scripts.tr_focus_view import build_focus_list, focus_list_markdown
+        stage_focus.write_text(
+            focus_list_markdown(build_focus_list(details, analysis), generated_at_hint),
+            encoding="utf-8",
+        )
+    except (OSError, ImportError, KeyError, TypeError, ValueError) as exc:
+        # A missing focus list must never cost the run its analysis.
+        print(f"WARNING: could not write the focus list: {exc}")
+        stage_focus = None
+
     hashes = {
         "details_sha256": sha256_file(stage_details),
         "analysis_sha256": sha256_file(stage_analysis),
         "report_sha256": sha256_file(stage_report),
     }
-    try:
-        run_dir.parent.mkdir(parents=True, exist_ok=True)
-        stage_dir.replace(run_dir)
-    except OSError as exc:
-        shutil.rmtree(stage_dir, ignore_errors=True)
-        write_attempt_status(
-            report_root, args.product, "validation_failed",
-            close_build=close_build, bug_codes=bug_codes,
-            message=f"Could not promote immutable run: {exc}",
-            latest_success=latest_success,
-        )
-        return 1
-    final_details = run_dir / stage_details.name
-    final_analysis = run_dir / stage_analysis.name
-    final_report = run_dir / stage_report.name
+    if stage_focus is not None:
+        hashes["focus_list_sha256"] = sha256_file(stage_focus)
+
+    # Build the manifest before promoting, so a copy of it can travel inside
+    # the immutable run. latest.json is overwritten by the next publish, and
+    # without this copy a past run keeps its artifacts but loses every fact
+    # about itself — cohort size, model, Close Build, TR codes — which is
+    # exactly what the history view needs. Paths are relative to product_dir
+    # and run_dir is already known, so nothing here depends on the promote.
     meta = details.get("meta", {})
-    generated_at = str(analysis.get("generated_at") or datetime.now(timezone.utc).isoformat())
+    generated_at = generated_at_hint
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "product": args.product,
@@ -5438,10 +5862,36 @@ def main() -> int:
         "source_sha256": source_hash,
         "engine_sha256": engine_hash,
         **hashes,
-        "details_path": final_details.relative_to(product_dir).as_posix(),
-        "analysis_path": final_analysis.relative_to(product_dir).as_posix(),
-        "report_path": final_report.relative_to(product_dir).as_posix(),
+        "details_path": (run_dir / stage_details.name)
+        .relative_to(product_dir).as_posix(),
+        "analysis_path": (run_dir / stage_analysis.name)
+        .relative_to(product_dir).as_posix(),
+        "report_path": (run_dir / stage_report.name)
+        .relative_to(product_dir).as_posix(),
     }
+    if stage_focus is not None:
+        manifest["focus_list_path"] = (
+            (run_dir / stage_focus.name).relative_to(product_dir).as_posix()
+        )
+    try:
+        write_json(stage_dir / "manifest.json", manifest)
+    except OSError as exc:
+        # The run's artifacts are what matter; losing its own manifest copy
+        # costs history detail, not the report.
+        print(f"WARNING: could not write the run manifest: {exc}")
+    try:
+        run_dir.parent.mkdir(parents=True, exist_ok=True)
+        stage_dir.replace(run_dir)
+    except OSError as exc:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        write_attempt_status(
+            report_root, args.product, "validation_failed",
+            close_build=close_build, bug_codes=bug_codes,
+            message=f"Could not promote immutable run: {exc}",
+            latest_success=latest_success,
+        )
+        return 1
+    final_report = run_dir / stage_report.name
     try:
         write_json(latest_path, manifest)
     except OSError as exc:
@@ -5457,6 +5907,7 @@ def main() -> int:
         close_build=close_build, bug_codes=bug_codes,
         message="Published a validated immutable TR Test Focus run.",
         latest_success=generated_at,
+        build_trs=build_trs,
     )
     print(f"[{args.product}] Latest TR test focus -> {final_report}")
     return 0

@@ -72,6 +72,367 @@ Scripts run in this fixed order per product — each stage outputs CSV/JSON file
 
 `pages/02_Pending_Module_Review.py` — Streamlit sub-page for reviewing fuzzy-matched module mappings (`*_pending.json`).
 
+### Bug codes are always links (`ecl_links.py`)
+
+A BugCode shown anywhere on the dashboard, or written into `focus_list.md`,
+opens its eCL eBug page. One module owns the URL and the code pattern
+(`[A-Z]{2,4}\d{6,7}-\d{4}`, covering all eight products' prefixes); nothing
+else should build that URL by hand.
+
+Three entry points, by what the caller knows:
+
+- `bug_link(code)` — the caller has a `bug_code` field. Used by
+  `focus_list_markdown`, so the links are in the **file**, not just the page:
+  QA downloads that markdown and a code they cannot click is one they paste
+  into eCL by hand.
+- `linkify_bug_codes(text)` — codes are buried in prose nobody vetted: model
+  narrative, RD fix notes, gate diagnostics, or a `focus_list.md` archived by a
+  run that predates linking. Idempotent, and it leaves code fences, existing
+  links, URLs and non-trivial backtick spans alone, so a code quoted inside a
+  snippet stays a snippet.
+- `link_column_values(values)` — behind `show_dataframe()`, the dashboard's
+  `st.dataframe` wrapper. It decides from the **values**, not the column name,
+  which is why `Source bug` and `analog_bug_code` link without being listed
+  anywhere. A cell holding several codes (`"A · B · C"`) stays text: a
+  dataframe cell carries one URL, not markdown. Those tables live in the
+  diagnostics expanders; prose renderings of the same lists get linkified.
+
+### Direct ECL access (IF3 REST)
+
+`ecl_if3.py` and `ecl_query.py` are **vendored upstream tools — do not edit
+them**, so they can be re-synced from their source. `ecl_direct.py` is the
+adapter and the only file that knows both the IF3 row shape and this toolkit's
+record shape; pipeline stages import `ecl_direct`, never `ecl_if3` directly.
+
+Stage 8 (`process_newest_tr.py`) uses it for three things, all skipped silently
+when no token is present:
+
+1. **Detail backfill** — when n8n's eCL node has spent its two retry rounds on
+   a BugCode, the same `getOldeBug` record is fetched over IF3 REST before
+   falling back to a summary-only CSV stub. Recorded in
+   `meta.ecl_direct_backfill`. It is a second *transport*, not a second copy of
+   the data: `DRI261882-0021` fails on both, because eCL's own stored procedure
+   answers `HTTP 500 String or binary data would be truncated` for that record.
+   It recovers transport failures, not server-side ones.
+2. **TR context** — `meta.tr_context` carries the real Testing Request records
+   and both eBug relations (`TSR.eBugByTR` = found on the TR,
+   `TSR.AttachedEBug` = attached for verification). The cohort itself is a
+   *Close Build*, which bundles many TRs — the 2026-09-15 pdri report spanned 9.
+   `TR.SP.GetOldTRData` is absent from the ECL guide's model list, so the TR
+   record falls back to the documented `TSR.TRSearch`; both return the same
+   field names. This product's TRs are old-format (3-digit serial), so the
+   fallback is the likely path.
+   **`IsVerified` and `BugResult` are different flags** — the first says the
+   attachment was checked, the second says it *passed*. A verified failure is
+   the most urgent row on the page, so never treat "verified" as "done".
+   Cancelled TRs (`FormState = Cancel`) still come back from eCL and are
+   flagged in the dashboard. The two TR models are **merged, not chosen
+   between**: `GetOldTRData` answers `FormState` with null (so a cancelled TR
+   reads as Normal) while `TRSearch` carries no `Result` / `IsGMBuild` /
+   `RefBugs`. `Result` is the TR's own verdict — "Fail" on 8 of 9 live TRs,
+   which is normal for a round that found bugs, so it is stated, not alarmed.
+
+   RD resolution notes (`RootCause` / `Solution` / `Risk` / `TraceURL`) were
+   already fully captured by `enrich_from_raw`. `TraceURL` reaches the prompt
+   but not the grounding map (a URL cannot support a textual claim), so
+   `collect_changesets` surfaces it in the dashboard instead — 23 of 26 cohort
+   bugs carry one. RD writes the field freehand ("PR: https://…", or a bare
+   commit hash), so the URL is extracted rather than prefix-matched.
+3. **Cohort audit** — `meta.cohort_audit` checks the cohort against eCL's own
+   TR-to-eBug relation, matching on **Close Build#, not status**. Costs zero
+   extra API calls: both relations already return `CloseToBuild`, and a null
+   there means "not fixed into any build" — an exclusion, not an unknown
+   (conflating the two burned 60 needless calls). Reports only;
+   `--ecl-complete-cohort` folds any misses in.
+
+### The Focus List (`focus_list.md`)
+
+Stage 8's primary output and the first thing on the TR Test Focus tab. Built by
+`tr_focus_view.build_focus_list()` from the details + analysis artifacts,
+written into the run directory and hashed into the manifest as
+`focus_list_path` / `focus_list_sha256`. The dashboard prefers that file so the
+page and the file cannot disagree, rebuilding only for runs made before it
+existed.
+
+**Deterministic and ungated on purpose.** Recommended Regression Areas makes
+*predictions*, and its gates suppress anything that merely restates a fix —
+correct for precision, and exactly wrong for coverage, where "re-test the path
+that was fixed" is a must-do rather than noise. Every focus-list entry is
+something eCL or RD already recorded, so there is no claim about the future to
+ground and nothing to hallucinate. It cannot come back empty.
+
+**Escape RD prose before it reaches markdown.** `_md_safe` replaces `$` with
+`\$`: Streamlit renders `$...$` as LaTeX, and DRI261880-0060's fix note quotes
+`"Costs %1$d credit per second. Minimum %2$d credits."` — everything between the
+two dollars was taken as math and rendered one character per line. Quotes are
+also stripped of list punctuation RD pastes in ("- widthOfWaveCell(at:)…"),
+deduplicated against the instructions already shown in section 3, and grouped
+by the set of bug codes they cover so one bug never spans two bullets.
+
+Written to be skimmed before standup: a headline answering "where do I start",
+a table for the module ranking, every bug code linked to its eBug page with the
+backticks *inside* the link label so a run of codes still wraps instead of
+forming one long line, fix-note quotes trimmed at a word boundary rather than
+pasted whole, and identical RD instructions grouped onto one bullet. **No raw
+HTML** — `st.markdown` escapes it by default, so `<sub>` would render as
+literal text in the dashboard.
+
+Section order follows what QA has to decide, not what is interesting:
+
+1. **Waiting on you** — bugs the *build's own TR* was created from that
+   nobody has verified yet (see "The build TR's three bug lists" below)
+2. **Where the changes are** — modules ranked by fix count, then severity
+3. **RD asked for this specifically** — non-placeholder `Risk` notes + locales
+4. **Shared paths named in the fix notes** — the adjacency quotes, verbatim
+5. **Thin evidence** — degraded records and evidence-only checklist fallbacks
+6. **Seen before** — per *module*, how many fixes have prior similar defects
+7. **Fixed earlier in this version** — every bug closed into an *earlier* build
+   of the Close Build's x.y.z (`meta.version_fixes`, from `ecl_parsed.csv`;
+   later builds excluded, they are not in the build). They ship in this build
+   too, and a verified fix is still changed code, so they are regression
+   surface. Modules this build changes again rank first.
+8. **Already verified** — listed by code, not just counted; nothing left to verify
+
+Between 7 and 8 sits an unnumbered **Found on this TR so far**: the build TR's
+generated bugs, listed so nobody files a duplicate.
+
+**The build TR's three bug lists.** An eCL TR page shows three, and they mean
+different things (confirmed against TR260922-0013, 2026-09-29):
+
+| eCL label | IF3 source | Role |
+|---|---|---|
+| Bugs from which this Testing Request is created | `TSR.AttachedEBug` (= the TR record's `RefBugs`) | **The TR's scope — the queue** |
+| This TR Generated the following eBug(s) | `TSR.eBugByTR` | New bugs found this round |
+| Known bugs | *not exposed* by any IF3 model or `TSR.TRFormData` | Not shown |
+
+`ecl_direct.find_build_trs` reads the first two for each non-cancelled build TR
+(`bugs_loaded: True` marks a TR whose lists were read). **The queue is read from
+the build TR only.** It used to be read from `meta.tr_context`, the TRs the
+cohort's bugs were *reported* on. Those are earlier rounds, always fully
+verified, so "Waiting on you" was blank on nearly every run. With no build TR
+lists the queue is *unknown*, never "nothing outstanding".
+
+**A TR's scope is not the Close Build's cohort.** TR260922-0013 (build
+`16.8.0.189304`) was created from 18 bugs. Only 1 of them is closed to 189304:
+13 are closed to 189251 / 189285, whose own TRs were cancelled, and 4 `P` bugs
+carry no Close Build# at all. The queue marks each such bug instead of
+dropping it. The cohort, and so sections 2–6 and the model analysis, is still
+defined by Close Build#.
+
+The dashboard takes `build_trs` from `status.json` when it is for the same
+build. Every Stage 8 attempt rewrites that file, including `unchanged` ones,
+while a run's own copy is frozen at publish, and the queue moves as QA
+verifies. When the two differ, the focus list is rebuilt rather than served
+from the run's file, and a caption says so.
+
+**Count attached bugs once, and let eCL status win.** (Counts below predate
+the build-TR queue, when attachments came from the provenance TRs.)
+`attached_bug_outcomes()` is the single source for both the focus list and
+`verification_tally()`. A bug re-attached to a later TR is one bug (the later
+TR, by code order, gives the verdict), and an eBug status of `Close` / `Fail`
+overrides any round's verdict. Per-row counting showed 71 passed + 9 failed
+for 78 bugs on 2026-09-23: two bugs sat in both piles, and 8 of the 9
+"failed" had since been re-fixed and closed.
+
+**Format marker.** Line 1 of `focus_list.md` is `[//]: # (focus-list format N)`
+(invisible when rendered). The live tab rebuilds a stored file lacking the
+current `FOCUS_LIST_FORMAT` from that run's stored evidence and says so;
+otherwise a builder fix would not appear until the evidence changed, since an
+unchanged run is never republished. Bump it whenever the list's content
+changes. For runs made before `meta.version_fixes` existed, the rebuild reads
+section 7 from the current `ecl_parsed.csv`, with a caption.
+
+**AT cases (`tr_at_cases.py`) are listed, not run.** The source is the AT_PDRi
+repo (pdri only), never the `tests/generated` skeletons here. Its folder has no
+default: it is set once from the tab's expander and saved to the git-ignored,
+repo-local `.at_repos.json` (`{"pdri": "/abs/path"}`), which every later render
+reuses; `$AT_PDRI_DIR` overrides it. Unset, the tab says so and lists nothing. Changed modules plus section-7 modules are
+matched to its `tests/new_bft_ios` / `tests/new_sft_ios` files on the feature
+named in each file's docstring, normalised like eCL's `parsed_module`
+(`MODULE_ALIASES` holds renames; matching is exact, so AI Anime never pulls in
+AI Anime Video). **The unit is a file**: every case is a `pytest-dependency`
+chain link, so a single case cannot run alone. AT_PDRi has no module marker —
+its Allure epic/feature/story labels are case-*age* cohorts set at runtime.
+Commands install the Close Build first (`test_00`, `--app-version` /
+`--build-number` split from `16.8.0.189304`); both BFT and SFT cover every
+matched module — changed and regression alike — and SFT ends with the
+`test_99` My Artwork sweep. Kept out of `focus_list.md` because it depends on
+another repo's state, not the run. Verified with `--collect-only
+--no-case-sync` (2026-09-24: 252 BFT / 2,383 SFT, order preserved, node IDs
+identical to the page's index). AT_PDRi's `requirements.txt` is UTF-16 and
+omits `pyyaml`, which its `src/core/config_loader.py` imports.
+
+**A QA "Fail" verdict is finished work.** A colleague already checked the bug,
+it failed, and it went back to RD to fix. It belongs in "Already verified",
+never in the queue — putting it under work-to-do tells QA to redo something it
+no longer owns.
+
+The focus list is the **only** place that decides this. An earlier
+`outstanding_attached_bugs()` helper encoded the opposite rule (verified
+failures ranked first, as the most urgent thing to test) and rendered its own
+block further down the same page: the focus list said "nothing outstanding"
+while that block called the same 3 bugs "3 outstanding". It has been removed
+rather than fixed twice. `verification_tally()` stays — it is the one place
+passed / failed / not-verified remain distinct, and the focus list reads it.
+
+Two traps the implementation encodes: RD fills `Risk` with `none` / `N/A` far
+more often than real text, so placeholders are filtered; and per-bug historical
+analogs cap at 3 (1 same-module + 2 adjacent), so ranking bugs by that count
+just lists whoever hit the cap — 16 identical "3"s on one build. Section 6
+aggregates by module instead.
+
+### Recent runs (`tr_history.py`)
+
+The last 10 days of published runs, at the bottom of the TR Test Focus tab
+under the per-bug work and above the diagnostics. Stage 8 never rewrites a
+promoted run, so `tr_reports/<label>/runs/<UTC stamp>_<hash8>/` already *is* the
+history — only `latest.json` is overwritten. The module reads that tree and
+writes nothing.
+
+Stage 8 now drops a copy of the manifest into each run as `manifest.json`
+(same dict `latest.json` gets, built before the promote). Without it a past run
+keeps its artifacts but loses every fact about itself. `MANIFEST_SCHEMA_VERSION`
+stays at 2 — it is an added file, not a schema change, and a bump would miss
+`manifest_cache_hit` for every product and force a full LLM re-analysis.
+
+Per-run facts come from, in order: `manifest.json`, then the one-line provenance
+comment `summarize_tr_bugs.py` writes as line 1 of `test_focus_summary.md`
+(model, real Close Build, bug count — the only per-run record for runs published
+before the manifest copy), then the directory. `provenance` says which answered,
+because the directory name is a *sanitized label* and can differ from eCL's
+build string (`0916_25.0.7_365_Ultra_Ultimate_VL`). The header's date is **not**
+read as the run time: it is bare local time from `datetime.now()`, while the
+directory stamp is UTC.
+
+Three claims the view refuses to make:
+
+- **A day with no entry is a day nothing changed**, not a failed run — a run is
+  published only when the evidence, model, or analysis schema changed, and an
+  `unchanged` outcome writes only `status.json`. Failures leave nothing at all,
+  since `status.json` holds the newest attempt only.
+- **A bug-count delta means something only within one Close Build.** Two builds
+  are two cohorts. `16.8.0.189063` really did go 20 → 26 overnight as more bugs
+  closed into it, which is worth seeing; the 1 bug of the build before it is not
+  a "-25". Blank across a build change, `0` when unchanged.
+- **Past runs are reported, not re-verified.** `audit_report_manifest` checks
+  hashes for the run `latest.json` points at; nothing re-hashes the ones behind
+  it.
+
+Opening a past run prefers the `focus_list.md` that run wrote — the same
+artifact-over-rebuild rule the live page follows, so an archived page and the
+archived file cannot disagree. Runs older than the focus list are rebuilt from
+that run's own stored evidence (deterministic), and the caption says so instead
+of passing the rebuild off as the artifact.
+
+### Page-consistency traps
+
+The TR Test Focus tab describes the same data in several places, and each of
+these was found contradicting another on a live page:
+
+- **The 9 TR codes are provenance, not scope.** They test the build each bug
+  was *reported against* — on 2026-09-17 not one of them tested the cohort's
+  own Close Build. The metric card ("not the TR for this Close Build") is
+  right; any label saying "in this Close Build" is wrong.
+  The TR that *does* test the build is found by `ecl_direct.find_build_trs`
+  (`TSR.TRSearch` on `TRBuild`, filtered to an exact build + product, since
+  `match` is a substring match) — `16.8.0.189304` → `TR260922-0013`. Stored as
+  `meta.build_trs` and in `status.json` (an unchanged run is never
+  republished, so status is how a newer lookup reaches an older run's page).
+  TR links go through `ecl_links.tr_url`: eCL's ASP handler, which redirects
+  new-format codes to `/IF3/tr/BPM/FormView/<code>` and serves old ones itself.
+- **The attached-bug queue has exactly one owner**, `build_focus_list`. Queue +
+  passed + failed must equal what eCL attached, or a bug lands in two sections
+  or none.
+- **Status glossary.** `RDResolved` = RD applied a fix, awaiting code review.
+  `TRCreated` = a *Testing Request* covers it, built and waiting for QA — the
+  last stage before Close, not "in Technical Review". Observed order:
+  `Assigned → RDResolved → NeedCodeReview → CodeReviewed → BuildResolved →
+  TRCreated → Close`.
+- **The hero and help text describe sections that can be hidden.** Point them
+  at the focus list, which always renders.
+
+### Recommended Regression Areas is publish-or-hide
+
+The predictions section renders only when something clears the grounding gates.
+Test the narrative report against `NO_GROUNDED_REGRESSION`, never for
+truthiness: when nothing is grounded the report still *contains* that sentence,
+so a plain `if report_text` keeps the section alive displaying exactly the empty
+state being hidden. It is **hidden, not shown empty** — an empty predictions section is noise on a
+page whose job is telling QA what to test, and it is empty whenever the gates
+do their job. Withheld drafts remain under *Candidates withheld by grounding
+audit* in the diagnostics expander for anyone tuning the gates.
+
+Candidate generation still runs: the retrospective checks depend on it, and it
+would start producing if Stage 8 ever gained a stronger model. On the
+2026-09-16 pdri build, qwen3:4b emitted 6 candidates from 19 bugs carrying
+adjacency signals, 2 were malformed, and all 4 survivors were restatements of
+their own source bug. The evidence and the gates were both working; the model
+was the bottleneck.
+
+### Cohort membership: Close Build#, not status
+
+`select_newest_tr_cohort` selects the *build* from `TRCreated` rows — correct,
+and self-limiting, because a fully-verified build has none and needs no report.
+**Membership is every bug closed to that build, whatever its status now.**
+
+A bug goes `TRCreated` → `Close` within hours of QA verifying it, so filtering
+membership on TRCreated made the cohort depend on when the pipeline ran: build
+`16.8.0.189063` held 26 bugs at 17:00 and 20 by the 19:30 run. The six were
+verified, not lost — but their changes are in the build either way, which is
+what the adjacent-regression analysis reasons about, and dropping them removed
+the entire *Creator Music* module plus two RD "Please verify all languages"
+notes from the report. Downstream distinguishes them by `Status`.
+
+The outlier rule stays scoped to `TRCreated` and requires a real build string:
+`close_build_family("")` differs from the dominant family, so widening it pulled
+in 43 `NewCreated`/`Assigned`/`Won't Fix` bugs never fixed into any build.
+
+`--no-ecl-direct` forces the n8n-only path on a machine that has a token.
+
+`scripts/eclq.py` is `ecl_query` with this repo's token resolution applied
+first — the vendored CLI reads only `$ECL_TOKEN` / `~/.ecl_token` and cannot
+see the repo-local `.ecl_token`:
+
+```bash
+./scripts/eclq.py tr TR260910-067          # TR record + both eBug relations
+./scripts/eclq.py bug DRI261883-0064       # full detail, root cause, fix
+```
+
+#### Token setup
+
+Get a personal API token yourself at <https://ecl.cyberlink.com/sso/mgm/tokenPage>
+— self-service, no approval, no VPN (but eCL SSO login is required). One token
+covers every TR / eBug endpoint. The Client ID / Secret requested from Jeffy
+Chuang are for the eCL **MCP connector**, not for this REST token.
+
+```bash
+cp .ecl_token.example .ecl_token   # then replace the placeholder line
+chmod 600 .ecl_token
+```
+
+`.ecl_token` is git-ignored; `.ecl_token.example` is the tracked template.
+Resolution order, in `ecl_direct.token_status()`:
+
+`$ECL_TOKEN` → `$ECL_TOKEN_FILE` → repo-local `.ecl_token` → `~/.ecl_token`
+
+The repo-local file is why the Jenkins user on the Mac Mini needs no second
+copy in its own home directory. Blank lines and `#` comments are stripped, so
+the example can document itself — `ecl_if3.token()` would otherwise send the
+whole file, comments included, as the bearer credential. A copy that still
+holds `PASTE_YOUR_ECL_TOKEN_HERE` is refused up front rather than failing as a
+401 midway through a stage, and a token file readable by other users warns.
+
+**Pipeline only — never a dashboard data source.** REST query tokens carry no
+permission filtering: a valid token reads every ticket in scope, including ones
+its holder could not open in the ECL web UI. The dashboard is a shared process
+on port 8501, so these calls belong in batch stages writing to immutable
+evidence snapshots, never behind a web control.
+
+`meta.tr_context` and `meta.cohort_audit` are **not** hashed by
+`analysis_source_hash` and are not fed to the model — they are evidence for a
+human reader, so adding them does not invalidate a cached analysis. Feeding
+them to the LLM would require adding them to that hash.
+
 ## Key Conventions
 
 ### Data File Naming

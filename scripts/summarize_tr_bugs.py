@@ -27,7 +27,7 @@ from pathlib import Path
 
 DEFAULT_MODEL = "qwen3:4b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-ANALYSIS_SCHEMA_VERSION = 38
+ANALYSIS_SCHEMA_VERSION = 40
 DEFAULT_SAFETY_LIMIT = 500
 VERIFICATION_BATCH_SIZE = 4
 REGRESSION_BATCH_SIZE = 12
@@ -425,6 +425,18 @@ def build_bug_block(bug: dict, max_log_chars: int) -> str:
         f"Close Build#: {bug.get('Close Build#')}",
         f"- Summary: {bug.get('Short Description') or '(none)'}",
     ]
+
+    # The structured analysis already receives ParsedModule / ModuleCategory via
+    # structured_bug_evidence; without them here the narrative report has to
+    # infer the area from the summary text alone, and the two disagree in
+    # practice — DRI261886-0057 reads "Cinematic Reel Creator" in its title
+    # while the taxonomy files it under module "Creator Music", category
+    # "Audio". Stating both keeps one vocabulary across the two artifacts.
+    if bug.get("ParsedModule") or bug.get("ModuleCategory"):
+        lines.append(
+            f"- Module: {bug.get('ParsedModule') or '(unmapped)'} | "
+            f"Category: {bug.get('ModuleCategory') or '(unmapped)'}"
+        )
 
     repro = stringify(bug.get("ReproSteps") or bug.get("Description"), max_log_chars)
     if repro:
@@ -840,13 +852,22 @@ def coverage_equivalence_tokens(value: object) -> set[str]:
 # Another member of that family is then supported by the evidence even though
 # the evidence never names it — which is the one case where requiring the
 # target's own name in the quote rejects a claim the quote actually makes.
+#
+# "handler" belongs in the family nouns for the same reason "call site" does:
+# "Route every long-task error handler through one shared message" is an RD
+# stating the fix spans a family, and omitting the word closed the only route
+# a genuine neighbour had. It stayed closed quietly — the run published
+# nothing and the generalization basis recorded the unremarkable
+# "no_stated_generalization_family_invoked", which looks identical to a model
+# that never tried to generalize at all.
 GENERALIZATION_FAMILY_PATTERN = re.compile(
     r"\b(?:matching|match(?:es|ed)?|like|as in|consistent with|aligned with|"
     r"same as|mirroring|following)?\s*"
     r"(?:every|each|all|any|the)\s+(?:other\s+)?"
     r"([a-z0-9][a-z0-9 _/-]{2,60}?)"
     r"\s*(?:path|paths|flow|flows|call site|call sites|site|sites|"
-    r"case|cases|surface|surfaces|screen|screens|entry point|entry points)\b",
+    r"case|cases|surface|surfaces|screen|screens|entry point|entry points|"
+    r"handler|handlers)\b",
     flags=re.I,
 )
 
@@ -959,6 +980,15 @@ def deterministic_direct_fix_basis(
 
     Same-module claims still survive when they contribute a distinctive term of
     their own: a different surface inside one module is genuine adjacency.
+
+    A claim that names a different module still has to say something the source
+    bug did not. Gating the novelty requirement on the module match alone left
+    a hole: a candidate that renamed its target to a phrase lifted straight
+    from the fix note ("Model selector label", from "Center-align the model
+    selector label") no longer matched the module, so it was waved through with
+    no novel terms at all and published as "verify the label is center-aligned"
+    — the fix restated. Novelty is now required either way; the module match
+    only decides how much.
     """
     def tokens(value: object) -> set[str]:
         return {
@@ -1013,11 +1043,21 @@ def deterministic_direct_fix_basis(
         and not (morphology_forms(token) & evidence_forms)
     )
     # One stray word is padding, not a different surface: a same-module claim
-    # has to carry at least two terms its source bug never used.
-    supported = (not same_module) or len(novel_terms) >= 2
+    # has to carry at least two terms its source bug never used. A claim
+    # pointing elsewhere needs only one, but zero is a restatement wearing a
+    # different name — the fix note's own words are not a new target.
+    #
+    # The floor cannot be raised to two for every claim: the target gate
+    # requires the area to appear in the cited quote, so a legitimate
+    # "bug in surface A, fix names a shared component, predict surface B"
+    # claim is *obliged* to reuse the evidence's vocabulary and would be
+    # withheld. Catching a synonym-level near-restatement needs a separate
+    # scenario-novelty check, not a higher count here.
+    novel_term_minimum = 2 if same_module else 1
+    supported = len(novel_terms) >= novel_term_minimum
     return {
-        "schema_version": 1,
-        "policy": "deterministic_direct_fix_restatement_v1",
+        "schema_version": 2,
+        "policy": "deterministic_direct_fix_restatement_v2",
         "supported": supported,
         "rule": (
             "adjacent_to_the_cited_fix" if supported
@@ -1025,7 +1065,7 @@ def deterministic_direct_fix_basis(
         ),
         "targets_source_module": same_module,
         "novel_claim_terms": novel_terms[:20],
-        "novel_term_minimum": 2,
+        "novel_term_minimum": novel_term_minimum,
     }
 
 
@@ -1305,8 +1345,35 @@ def deterministic_shared_path_support_basis(
 def deterministic_evidence_ref_completion(
     area: str, source_bug_codes: list[str], evidence_refs: list[dict],
     evidence_map: dict, *, max_refs: int = 4,
+    trigger: str | None = None, rationale: str | None = None,
 ) -> tuple[list[dict], dict]:
-    """Complete a model's refs when its cited BugCodes contain an exact target."""
+    """Complete a model's refs from its own cited BugCodes' uncited signals.
+
+    Two independent reasons a cited signal set is incomplete, each scanned
+    separately because they rescue different gates:
+
+    Target completion runs only when the refs do not anchor the area, and adds
+    a signal that names it.
+
+    Generalization completion runs whatever the target state is, and adds a
+    signal stating the fix spans a family of call sites. A model that cites the
+    root cause and paraphrases the solution leaves the family phrase uncited,
+    and `deterministic_generalization_support_basis` reads only cited quotes —
+    so the override it exists to grant could never fire. Gating this scan on an
+    unsupported target (as target completion is) closes it precisely when the
+    claim is well-formed: DRI261885-0042 cited signal 0 ("Error codes 6000 and
+    6008 ...") while "Route every long-task error handler through one shared
+    message" sat uncited at signal 1, the target was already anchored, and the
+    run recorded the unremarkable "no_stated_generalization_family_invoked".
+
+    Neither scan leaves the candidate's own source_bug_codes, invents a quote,
+    or raises confidence: added quotes enter the correlation check, which can
+    only merge independence groups downward.
+
+    Passing neither `trigger` nor `rationale` keeps the pre-schema-40 basis
+    shape verbatim, so `structured_prediction_errors` still revalidates stored
+    reports written before the generalization scan existed.
+    """
     original_refs = [
         {
             "bug_code": str(ref.get("bug_code") or ""),
@@ -1318,33 +1385,64 @@ def deterministic_evidence_ref_completion(
     initial_support = deterministic_adjacency_support_basis(
         area, original_refs,
     )
-    matching_refs = []
+    # A family phrase is only usable when the claim carries a trigger and a
+    # rationale to invoke it with; without both there is nothing to match.
+    generalization_scanned = trigger is not None or rationale is not None
+    generalization_evaluable = bool(
+        str(trigger or "").strip() and str(rationale or "").strip()
+    )
+    initial_generalization = deterministic_generalization_support_basis(
+        area, str(trigger or ""), str(rationale or ""), original_refs,
+    )
     original_keys = {
         (ref["bug_code"], ref["signal_index"]) for ref in original_refs
     }
-    if not initial_support["supported"]:
+
+    def uncited_signal_refs():
         for code in source_bug_codes:
             signals = (
                 (evidence_map.get(code) or {}).get("adjacency_signal_quotes")
                 or []
             )
             for signal_index, quote in enumerate(signals):
-                key = (str(code), signal_index)
-                if key in original_keys:
+                if (str(code), signal_index) in original_keys:
                     continue
-                ref = {
+                yield {
                     "bug_code": str(code),
                     "signal_index": signal_index,
                     "quote": str(quote),
                 }
-                if deterministic_adjacency_support_basis(
-                    area, [ref],
-                )["supported"]:
-                    matching_refs.append(ref)
+
+    matching_refs = []
+    if not initial_support["supported"]:
+        matching_refs = [
+            ref for ref in uncited_signal_refs()
+            if deterministic_adjacency_support_basis(area, [ref])["supported"]
+        ]
+    matching_generalization_refs = []
+    if generalization_evaluable and not initial_generalization["supported"]:
+        matching_generalization_refs = [
+            ref for ref in uncited_signal_refs()
+            if deterministic_generalization_support_basis(
+                area, str(trigger or ""), str(rationale or ""), [ref],
+            )["supported"]
+        ]
+
+    # Target refs take the budget first: without one the candidate is withheld
+    # outright, while a missing family phrase only forgoes an override.
     available_slots = max(0, max_refs - len(original_refs))
     added_refs = matching_refs[:available_slots]
-    final_refs = original_refs + added_refs
+    added_keys = {(ref["bug_code"], ref["signal_index"]) for ref in added_refs}
+    added_generalization_refs = [
+        ref for ref in matching_generalization_refs
+        if (ref["bug_code"], ref["signal_index"]) not in added_keys
+    ][:max(0, available_slots - len(added_refs))]
+    all_added_refs = added_refs + added_generalization_refs
+    final_refs = original_refs + all_added_refs
     final_support = deterministic_adjacency_support_basis(area, final_refs)
+    final_generalization = deterministic_generalization_support_basis(
+        area, str(trigger or ""), str(rationale or ""), final_refs,
+    )
     if initial_support["supported"]:
         status = "not_needed"
     elif added_refs and final_support["supported"]:
@@ -1353,18 +1451,49 @@ def deterministic_evidence_ref_completion(
         status = "reference_limit_reached"
     else:
         status = "no_matching_signal_in_candidate_bugcodes"
+    if not generalization_evaluable:
+        generalization_status = "not_evaluated"
+    elif initial_generalization["supported"]:
+        generalization_status = "not_needed"
+    elif added_generalization_refs and final_generalization["supported"]:
+        generalization_status = "completed_from_candidate_bug_signal"
+    elif matching_generalization_refs:
+        generalization_status = "reference_limit_reached"
+    else:
+        generalization_status = "no_stated_generalization_family_in_candidate_bugcodes"
     basis = {
-        "schema_version": 1,
-        "policy": "bounded_candidate_bug_target_reference_completion_v1",
+        "schema_version": 2 if generalization_scanned else 1,
+        "policy": (
+            "bounded_candidate_bug_signal_reference_completion_v2"
+            if generalization_scanned
+            else "bounded_candidate_bug_target_reference_completion_v1"
+        ),
         "status": status,
-        "applied": bool(added_refs),
+        **({"generalization_status": generalization_status}
+           if generalization_scanned else {}),
+        "applied": bool(all_added_refs),
         "maximum_evidence_refs": max_refs,
         "original_evidence_refs": original_refs,
         "matching_uncited_evidence_refs": matching_refs,
-        "added_evidence_refs": added_refs,
+        **({
+            "matching_uncited_generalization_refs": matching_generalization_refs,
+        } if generalization_scanned else {}),
+        "added_evidence_refs": all_added_refs,
+        **({
+            "added_target_evidence_refs": added_refs,
+            "added_generalization_evidence_refs": added_generalization_refs,
+        } if generalization_scanned else {}),
         "final_evidence_refs": final_refs,
         "initial_target_supported": initial_support["supported"],
         "final_target_supported": final_support["supported"],
+        **({
+            "initial_generalization_supported": (
+                initial_generalization["supported"]
+            ),
+            "final_generalization_supported": (
+                final_generalization["supported"]
+            ),
+        } if generalization_scanned else {}),
         "scans_only_candidate_source_bug_codes": True,
         "changes_source_bug_codes": False,
         "historical_analogs_influence_completion": False,
@@ -1939,6 +2068,85 @@ def ungrounded_boundary_components(scope_boundary: str,
     return sorted(
         (boundary_tokens & BOUNDARY_COMPONENT_TERMS) - grounding_tokens
     )
+
+
+def ground_scope_boundary(scope_boundary: str, area: str,
+                          *grounding_values: object) -> tuple[str, dict]:
+    """Narrow a boundary that imports an unsupported component, instead of dropping.
+
+    A scope boundary is framing: it says what the check does *not* cover. When
+    a model decorates it with an internal component the evidence never names
+    ("...other network paths are unaffected"), the whole candidate was dropped
+    as malformed, taking a grounded area, trigger and failure mode with it.
+    That is the entire loss recorded for the 16.7.5.188935 coverage challenge:
+    one invented word, "network", in one field.
+
+    Dropping the offending clause is strictly narrowing — the check covers no
+    more than before — so it cannot manufacture grounding. The model's own
+    wording is kept whenever the remainder still limits scope and names the
+    target; only when nothing survives does a deterministic template stand in.
+    Anything the trim cannot rescue is still reported as malformed.
+    """
+    ungrounded = ungrounded_boundary_components(
+        scope_boundary, area, *grounding_values
+    )
+    basis = {
+        "schema_version": 1,
+        "policy": "narrow_ungrounded_boundary_components_v1",
+        "status": "not_needed",
+        "applied": False,
+        "original_scope_boundary": scope_boundary,
+        "ungrounded_components": ungrounded,
+        "rule": "",
+    }
+    if not ungrounded:
+        return scope_boundary, basis
+
+    def still_ungrounded(text: str) -> bool:
+        return bool(ungrounded_boundary_components(
+            text, area, *grounding_values
+        ))
+
+    def usable(text: str) -> bool:
+        return bool(
+            text and not still_ungrounded(text)
+            and not prediction_boundary_errors(
+                area, text,
+                # Only the scope_boundary half is under repair here; pass a
+                # boundary-shaped stand-in so the observation's own rules
+                # cannot veto a scope fix.
+                f"Lower this hypothesis if {area} remains correct",
+                "candidate",
+            )
+        )
+
+    kept = [
+        clause for clause in re.split(r"\s*[;,]\s*", scope_boundary)
+        if clause.strip() and not still_ungrounded(clause)
+    ]
+    trimmed = _clean_model_text("; ".join(kept), 320)
+    if usable(trimmed):
+        basis.update({
+            "status": "narrowed_to_grounded_clauses",
+            "applied": True,
+            "rule": "dropped_clauses_naming_ungrounded_components",
+        })
+        return trimmed, basis
+    templated = _clean_model_text(
+        f"Limited to {area} under the cited trigger; "
+        "other paths are out of scope for this check",
+        320,
+    )
+    if usable(templated):
+        basis.update({
+            "status": "replaced_with_target_scoped_limit",
+            "applied": True,
+            "rule": "deterministic_target_scoped_boundary",
+        })
+        return templated, basis
+    basis["rule"] = "no_grounded_boundary_available"
+    basis["status"] = "unrepairable"
+    return scope_boundary, basis
 
 
 def prediction_instruction_consistency_errors(
@@ -2580,6 +2788,28 @@ the direct fix check or invent internal components. A candidate is allowed only
 when its source has a non-empty adjacency_signal_quotes field, and its rationale
 must rely on one of those explicit broader-path quotes. If the quote does not
 support another surface or variant, omit the candidate. Return at most 6 candidates.
+Restating the fix is the most common way a candidate is rejected, so apply this
+word-level test before emitting one. Collect the words used by your area,
+trigger, and expected_failure_mode. Remove every word that already appears in
+the cited BugCode's own summary, description, and adjacency_signal_quotes.
+Count what survives. When your area names the same module as the source bug, at
+least TWO words must survive; when it names a different module, at least ONE
+must. A candidate whose surviving count is below that floor is the fix in
+different words and is withheld deterministically before any model critic sees
+it, so drop it and propose a different surface instead. Words that name no
+surface and no mechanism never survive this count at all: "feature",
+"behavior", "functionality", "option", "issue", "result", and bare QA verbs
+such as "verify", "display", "tap", "open", or "generate" are discarded before
+counting, as are inflections of a word the evidence already used. Padding the
+area name with one vague word ("... integration", "... handling") therefore
+buys a single surviving word at most and never rescues a same-module claim.
+Worked example: for a bug titled "the playhead cannot be dragged", a candidate
+whose failure mode is "playhead cannot be dragged after generating songs"
+survives zero words and is withheld. A candidate predicting that the waveform
+zoom level resets after seeking survives "zoom", "level", and "resets", and is
+allowed because it names a different surface reached through the seek path the
+quote describes. Note that "waveform" does not survive there, because the fix
+note already used that word; the claim stands on the three that do.
 The rationale must repeat at least one distinctive non-target shared-path term
 from an exact cited quote. Generic words such as shared, changed, component,
 manager, service, state, or path are insufficient by themselves. This is checked
@@ -2651,6 +2881,14 @@ in these shapes, replacing the angle-bracket parts with evidence-grounded text:
   <trigger>, lower this hypothesis."
 Keep the words "Limited to", "not implicated", "If", and "remains correct" (or
 equivalents such as "only", "excluding", "unaffected", "does not reproduce").
+In both fields, <adjacent target> means the literal text of your area field, not
+a sub-element inside it. Copy at least one word of four or more characters
+straight from area into each field. Naming only the control or screen you have
+in mind, such as "the x button", "the favorite page", or "the playhead", fails
+the check even when that element obviously belongs to the area, and the whole
+candidate is dropped. Write "If the AI Music Generator favorite page still lists
+the deleted song, lower this hypothesis", not "If the favorite page still lists
+it".
 Action must be a QA-executable test instruction beginning with a verb such as
 Verify, Exercise, Open, Generate, Compare, Repeat, Switch, Import, or Export.
 Never tell QA to modify, reset, refactor, or implement internal code/components.
@@ -3811,6 +4049,7 @@ def _validate_candidates(payload: dict, allowed_codes: list[str], evidence_map: 
                 evidence_ref_completion_basis,
             ) = deterministic_evidence_ref_completion(
                 area, source_codes, evidence_refs, evidence_map, max_refs=4,
+                trigger=trigger, rationale=rationale,
             )
         scenario_specificity_basis = deterministic_scenario_specificity_basis(
             trigger, expected_failure_mode, source_codes, evidence_refs,
@@ -3829,9 +4068,13 @@ def _validate_candidates(payload: dict, allowed_codes: list[str], evidence_map: 
                 f"{unsupported['specificity_kind']} detail "
                 f"{unsupported['term']!r} absent from current BugCode evidence"
             )
-        ungrounded_components = ungrounded_boundary_components(
+        scope_boundary, scope_boundary_basis = ground_scope_boundary(
             scope_boundary, area, trigger, expected_failure_mode, action,
             rationale, *(ref["quote"] for ref in evidence_refs),
+        )
+        ungrounded_components = (
+            scope_boundary_basis["ungrounded_components"]
+            if scope_boundary_basis["status"] == "unrepairable" else []
         )
         if ungrounded_components:
             ref_errors.append(
@@ -3924,6 +4167,8 @@ def _validate_candidates(payload: dict, allowed_codes: list[str], evidence_map: 
                 "generalization_support_basis": generalization_support_basis,
                 "direct_fix_basis": direct_fix_basis,
                 "scenario_specificity_basis": scenario_specificity_basis,
+                **({"scope_boundary_basis": scope_boundary_basis}
+                   if scope_boundary_basis["applied"] else {}),
             })
     return ([], errors) if errors else (normalized, [])
 
@@ -4171,6 +4416,8 @@ def _validate_candidate_grounding_repairs(
                 _, original_completion = deterministic_evidence_ref_completion(
                     original["area"], original["source_bug_codes"],
                     original["evidence_refs"], evidence_map, max_refs=4,
+                    trigger=str(original.get("trigger") or ""),
+                    rationale=str(original.get("rationale") or ""),
                 )
             repaired["evidence_ref_completion_basis"] = original_completion
         repaired_analogs = {
@@ -5361,11 +5608,28 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
                 })
             shared_path_basis = candidate.get("shared_path_support_basis") or {}
             direct_fix_basis = candidate.get("direct_fix_basis") or {}
+            generalization_basis = (
+                candidate.get("generalization_support_basis") or {}
+            )
+            # The same override the critic gets, applied to the same check the
+            # critic applies it to. It lived only after the model audit, so a
+            # family-member target — which by construction the quote cannot name
+            # — was withheld here as "target absent" and never reached the
+            # override that exists for it. Deterministic evidence outranks the
+            # lexical target test exactly as it does for the critic, and only
+            # for this one check; shared path and direct fix still decide.
+            target_supported = basis.get("supported") is True
+            if (
+                not target_supported
+                and generalization_basis.get("supported") is True
+            ):
+                candidate["generalization_target_override"] = True
+                target_supported = True
             # Only a claim that is otherwise grounded can be "the fix restated";
             # one that fails the target or shared-path gate is withheld for that
             # reason instead, so its recorded basis stays consistent.
             if (
-                basis.get("supported") is True
+                target_supported
                 and shared_path_basis.get("supported") is True
                 and direct_fix_basis.get("supported") is False
             ):
@@ -5384,7 +5648,7 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
                 })
                 continue
             if (
-                basis.get("supported") is True
+                target_supported
                 and shared_path_basis.get("supported") is True
             ):
                 supported.append(candidate)
@@ -5396,7 +5660,6 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
                     "adjacency_support_basis": basis,
                 })
                 continue
-            target_supported = basis.get("supported") is True
             reason = (
                 "shared_path_not_concrete"
                 if target_supported else "adjacent_target_absent_from_current_signal"
@@ -5879,6 +6142,11 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
             "evidence_ref_completion_basis": candidate[
                 "evidence_ref_completion_basis"
             ],
+            # Carries the reason this row's lexical target test may read as
+            # unsupported; without it the cross-process revalidation calls a
+            # legitimately overridden claim invalid.
+            **({"generalization_target_override": True}
+               if candidate.get("generalization_target_override") else {}),
             "historical_analog_refs": (
                 candidate.get("historical_analog_refs") or []
             ),
@@ -6286,6 +6554,9 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
         "target_category_taxonomy": target_categories,
         "target_category_support": category_support,
         "recommendations": recommendations,
+        "regression_coverage_floor": deterministic_regression_coverage_floor(
+            evidence, recommendations,
+        ),
         "checklist_generation": {
             "schema_version": 1,
             "policy": (
@@ -6300,6 +6571,166 @@ def generate_structured_analysis(data: dict, model: str, ollama_url: str,
             "deterministic_fallbacks": checklist_fallbacks,
         },
         "checklists": checklists,
+    }
+
+
+def deterministic_regression_coverage_floor(
+    evidence: list[dict], recommendations: list[dict],
+) -> dict:
+    """Give every fixed bug some coverage, without calling it an adjacency claim.
+
+    The adjacency gates are working as designed when they publish nothing: the
+    16.7.5.188935 cohort's only draft restated the fix it came from. But a
+    report whose regression section is empty gives QA nowhere to start, and the
+    material to do better is already computed and then discarded — the module
+    each bug was fixed in, and the historical analogs attached to it.
+
+    So this is a floor, not a rescue. It never enters `recommendations`, never
+    carries a confidence, risk or priority label, and never claims the current
+    fix implies anything about these areas. Two tiers, both deterministic:
+    historical co-occurrence (this module's past bugs shared vocabulary with
+    these modules) and the fixed surface itself (re-check what was just
+    changed). The second is always available, because a report exists only when
+    a bug was fixed — which is what makes the section impossible to empty.
+
+    Entries are emitted only for bugs no published recommendation already
+    covers, so a good report is not diluted by restating what it just said.
+    """
+    def module_tokens(value: object) -> set[str]:
+        return {
+            token for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+            if len(token) >= 3 and token not in GENERIC_TARGET_TERMS
+        }
+
+    def same_surface(left: object, right: object) -> bool:
+        # "Character Motion Swap" and "Character Motion Swap - REDRED" are one
+        # place to look. Comparing the strings said otherwise and produced a
+        # "go and check the module you just checked" entry.
+        left_tokens, right_tokens = module_tokens(left), module_tokens(right)
+        if not left_tokens or not right_tokens:
+            return False
+        return (
+            left_tokens <= right_tokens or right_tokens <= left_tokens
+            or len(left_tokens & right_tokens)
+            / len(left_tokens | right_tokens) >= 0.6
+        )
+
+    covered_codes = {
+        str(code)
+        for item in recommendations
+        for code in (item.get("source_bug_codes") or [])
+    }
+    entries = []
+    for item in evidence:
+        bug_code = str(item.get("bug_code") or "")
+        if not bug_code or bug_code in covered_codes:
+            continue
+        module = str(item.get("parsed_module") or "").strip()
+        category = str(item.get("module_category") or "").strip()
+        analogs = [
+            analog for analog in (item.get("historical_analogs") or [])
+            if isinstance(analog, dict)
+        ]
+
+        def analog_ref(analog: dict) -> dict:
+            return {
+                "source_bug_code": bug_code,
+                "analog_bug_code": str(analog.get("bug_code") or ""),
+                "module": str(analog.get("module") or "").strip(),
+                "relationship": str(analog.get("relationship") or ""),
+                "similarity_score": analog.get("similarity_score"),
+            }
+
+        # One entry per distinct place to look, however many analogs point
+        # there; several rows naming the same module is noise, not coverage.
+        adjacent_by_area: dict[str, list[dict]] = {}
+        same_module_analogs = []
+        for analog in analogs:
+            analog_module = str(analog.get("module") or "").strip()
+            if not analog_module or same_surface(analog_module, module):
+                # Its information still belongs to the fixed surface below.
+                same_module_analogs.append(analog)
+                continue
+            existing = next(
+                (area for area in adjacent_by_area
+                 if same_surface(area, analog_module)),
+                analog_module,
+            )
+            adjacent_by_area.setdefault(existing, []).append(analog)
+        for area, grouped in adjacent_by_area.items():
+            terms = list(dict.fromkeys(
+                term
+                for analog in grouped
+                for term in (
+                    analog.get("distinctive_overlap_terms")
+                    or analog.get("overlap_terms") or []
+                )
+            ))[:6]
+            analog_codes = ", ".join(
+                str(analog.get("bug_code") or "") for analog in grouped
+            )
+            entries.append({
+                "source_bug_code": bug_code,
+                "basis": "module_history",
+                "grounding": "historical_co_occurrence_not_current_fix",
+                "area": area,
+                "module_category": str(
+                    grouped[0].get("module_category") or category
+                ),
+                "action": (
+                    f"Run a regression pass over {area} and confirm its "
+                    "behaviour is unchanged"
+                ),
+                "why": (
+                    f"{area} previously produced {analog_codes}"
+                    + (f", sharing the terms {', '.join(terms)} with "
+                       f"{module or bug_code}." if terms else ".")
+                    + " This is history for the module that was fixed, not "
+                    "evidence from the current fix."
+                ),
+                "historical_analog_refs": [
+                    analog_ref(analog) for analog in grouped
+                ],
+            })
+        fixed_area = module or bug_code
+        prior_codes = ", ".join(
+            str(analog.get("bug_code") or "")
+            for analog in same_module_analogs
+        )
+        entries.append({
+            "source_bug_code": bug_code,
+            "basis": "fixed_surface",
+            "grounding": "cited_fix_surface",
+            "area": fixed_area,
+            "module_category": category,
+            "action": (
+                f"Re-run the existing {fixed_area} regression suite around the "
+                "behaviour this fix changed"
+            ),
+            "why": (
+                "The fix landed here, so this surface carries the change "
+                "itself. Verifying the reported defect is covered by the "
+                "per-bug checklist; this is the surrounding suite."
+                + (f" The same module previously produced {prior_codes}."
+                   if prior_codes else "")
+            ),
+            "historical_analog_refs": [
+                analog_ref(analog) for analog in same_module_analogs
+            ],
+        })
+    return {
+        "schema_version": 1,
+        "policy": "deterministic_module_history_and_fixed_surface_floor_v1",
+        "is_adjacency_prediction": False,
+        "influences_confidence": False,
+        "influences_risk": False,
+        "influences_priority": False,
+        "enters_prior_hypothesis_scoring": False,
+        "uncovered_bug_codes": sorted({
+            entry["source_bug_code"] for entry in entries
+        }),
+        "entry_count": len(entries),
+        "entries": entries,
     }
 
 
@@ -6551,6 +6982,39 @@ def render_analysis_markdown(analysis: dict) -> str:
             )
         for index, step in enumerate(checklist["steps"], start=1):
             lines.append(f"{index}. {_escape_markdown(step)}")
+        lines.append("")
+    floor_entries = [
+        entry for entry in (
+            (analysis.get("regression_coverage_floor") or {}).get("entries")
+            or []
+        )
+        if isinstance(entry, dict)
+    ]
+    if floor_entries:
+        # Deliberately after the checklists, and deliberately not a
+        # "Recommended Regression Area": these carry no risk or confidence
+        # rating and the report validator must never read them as graded
+        # recommendations.
+        lines.extend([
+            "", "# Baseline Coverage", "",
+            "> Not adjacency predictions and not rated. These say where the "
+            "fixed modules sit and what history says about them, so every "
+            "fixed bug has a starting point even when no adjacent area is "
+            "supportable from the fix details.",
+            "",
+        ])
+        for entry in floor_entries:
+            label = {
+                "module_history": "Module history",
+                "fixed_surface": "Fixed surface",
+            }.get(str(entry.get("basis") or ""), "Baseline")
+            lines.append(
+                f"- **{_escape_markdown(entry.get('area'))}** "
+                f"({_escape_markdown(label)}) — "
+                f"Action: {_escape_markdown(entry.get('action'))} "
+                f"Why: {_escape_markdown(entry.get('why'))} "
+                f"Source bug: {_escape_markdown(entry.get('source_bug_code'))}."
+            )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

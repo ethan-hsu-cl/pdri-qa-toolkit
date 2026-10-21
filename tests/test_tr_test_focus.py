@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -163,7 +164,16 @@ def _candidate_discovery_audit(candidates=None) -> dict:
     }
 
 
-def test_select_newest_tr_cohort_uses_trcreated_and_dominant_build(tmp_path):
+def test_select_newest_tr_cohort_keeps_the_build_whatever_the_status_now(tmp_path):
+    """Membership follows Close Build#; only build *selection* uses TRCreated.
+
+    A bug moves TRCreated -> Close within hours of QA verifying it, so a
+    membership filter on TRCreated makes the cohort depend on when the pipeline
+    happened to run. Observed on pdri: the same build yielded 26 bugs at 17:00
+    and 20 at 19:30. Their changes are in the build either way, which is what
+    the adjacent-regression analysis reasons about, so they stay in and
+    downstream distinguishes them by Status.
+    """
     csv_path = tmp_path / "ecl_parsed.csv"
     csv_path.write_text(
         "BugCode,Status,parsed_version,Close Build#,_status_changed\n"
@@ -178,7 +188,28 @@ def test_select_newest_tr_cohort_uses_trcreated_and_dominant_build(tmp_path):
     build, codes = select_newest_tr_cohort(csv_path)
 
     assert build == "16.6.5.187153"
-    assert codes == ["A", "B", "C"]
+    assert codes == ["A", "B", "C", "D", "E"]
+
+
+def test_cohort_membership_never_includes_a_bug_with_no_close_build(tmp_path):
+    """The outlier rule must not treat an empty build as "another format".
+
+    close_build_family("") differs from the dominant family, so widening the
+    outlier rule to every status pulled in 43 NewCreated / Assigned / Won't Fix
+    bugs on real data — bugs never fixed into any build.
+    """
+    csv_path = tmp_path / "ecl_parsed.csv"
+    csv_path.write_text(
+        "BugCode,Status,parsed_version,Close Build#,_status_changed\n"
+        "A,TRCreated,16.6.5,16.6.5.187153,true\n"
+        "UNFIXED,Assigned,16.6.5,,true\n"
+        "PROPOSED,Propose Won't Fix,16.6.5,,true\n"
+        "NEW,NewCreated,16.6.5,,true\n",
+        encoding="utf-8",
+    )
+    build, codes = select_newest_tr_cohort(csv_path)
+    assert build == "16.6.5.187153"
+    assert codes == ["A"]
 
 
 def test_select_newest_tr_cohort_follows_the_build_not_the_reported_version(tmp_path):
@@ -226,7 +257,7 @@ def test_select_newest_tr_cohort_prefers_newest_version_not_largest_batch(tmp_pa
     assert codes == ["NEW0"]
 
 
-def test_select_newest_tr_excludes_buildresolved_but_keeps_component_build(tmp_path):
+def test_select_newest_tr_keeps_buildresolved_and_the_component_build(tmp_path):
     csv_path = tmp_path / "ecl_parsed.csv"
     csv_path.write_text(
         "BugCode,Status,parsed_version,Close Build#,_status_changed\n"
@@ -239,7 +270,10 @@ def test_select_newest_tr_excludes_buildresolved_but_keeps_component_build(tmp_p
     )
     build, codes = select_newest_tr_cohort(csv_path)
     assert build == "16.6.5.187153"
-    assert codes == ["A", "A2", "C"]
+    # B is BuildResolved into this same build — its change ships here too.
+    assert codes == ["A", "A2", "B", "C"]
+    # The older build's bug stays out; this is membership, not a free-for-all.
+    assert "OLD" not in codes
 
 
 def test_close_build_sort_key_handles_product_build_formats():
@@ -818,7 +852,7 @@ def test_schema26_withholds_unanchored_target_before_model_critic(monkeypatch):
         "candidate_discovery_audit"
     ]
 
-    assert analysis["schema_version"] == 38
+    assert analysis["schema_version"] == 40
     assert analysis["recommendations"] == []
     assert discovery["adjacency_gate_evaluated_count"] == 1
     assert discovery["adjacency_gate_supported_count"] == 0
@@ -1051,7 +1085,7 @@ def test_schema26_completes_missed_target_reference_before_gate(monkeypatch):
         "candidate_discovery_audit"
     ]
 
-    assert analysis["schema_version"] == 38
+    assert analysis["schema_version"] == 40
     assert len(analysis["recommendations"]) == 1
     assert discovery["adjacency_gate_supported_count"] == 1
     assert discovery["adjacency_gate_withheld_count"] == 0
@@ -1173,7 +1207,7 @@ def test_schema27_reviewed_directional_alias_supports_gate_but_not_confidence(
         "candidate_discovery_audit"
     ]
 
-    assert analysis["schema_version"] == 38
+    assert analysis["schema_version"] == 40
     assert analysis["target_alias_policy"] == alias_policy
     assert len(analysis["recommendations"]) == 1
     assert discovery["reviewed_alias_supported_count"] == 1
@@ -2051,18 +2085,56 @@ def test_prediction_boundaries_must_limit_scope_and_define_a_passing_result():
     assert any("lacks explicit limiting language" in error for error in errors)
     assert any("observable passing result" in error for error in errors)
 
+    # An invented component is stripped from the boundary rather than taking a
+    # grounded area, trigger and failure mode down with it. The invariant the
+    # drop protected still holds: the surviving boundary names no component the
+    # evidence does not.
     invented_component = {
         **base,
         "scope_boundary": (
-            "Limit Timeline preview to the database cache; independent paths "
-            "are outside scope"
+            "Limit Timeline preview to the cited shared behavior; other "
+            "database cache paths are unaffected"
         ),
     }
     candidates, errors = summarize_tr._validate_candidates(
         {"candidates": [invented_component]}, ["A"], evidence_map
     )
-    assert candidates == []
-    assert any("invents component term" in error for error in errors)
+    assert errors == []
+    assert len(candidates) == 1
+    repaired = candidates[0]
+    assert summarize_tr.ungrounded_boundary_components(
+        repaired["scope_boundary"], repaired["area"], repaired["trigger"],
+        repaired["expected_failure_mode"], repaired["action"],
+        repaired["rationale"],
+        *(ref["quote"] for ref in repaired["evidence_refs"]),
+    ) == []
+    assert "database" not in repaired["scope_boundary"].casefold()
+    assert "cache" not in repaired["scope_boundary"].casefold()
+    basis = repaired["scope_boundary_basis"]
+    assert basis["applied"] is True
+    assert basis["status"] == "narrowed_to_grounded_clauses"
+    assert basis["ungrounded_components"] == ["cache", "database"]
+    # Narrowing only: the model's own surviving clause is kept verbatim, so the
+    # check covers no more than it proposed.
+    assert repaired["scope_boundary"] == (
+        "Limit Timeline preview to the cited shared behavior"
+    )
+
+    # A boundary whose only clause naming the target is also the ungrounded one
+    # has nothing to narrow to, so a deterministic target-scoped limit stands in.
+    wholly_invented = {
+        **base,
+        "scope_boundary": "Limit Timeline preview to the database cache engine",
+    }
+    candidates, errors = summarize_tr._validate_candidates(
+        {"candidates": [wholly_invented]}, ["A"], evidence_map
+    )
+    assert errors == []
+    assert candidates[0]["scope_boundary_basis"]["status"] == (
+        "replaced_with_target_scoped_limit"
+    )
+    assert "Timeline preview" in candidates[0]["scope_boundary"]
+    assert "database" not in candidates[0]["scope_boundary"].casefold()
 
     generic = {
         **base,
@@ -2334,6 +2406,18 @@ def test_direct_fix_restatements_are_withheld_before_the_critic():
         "Favorites category is skipped", ["A"], evidence_map,
     )["supported"] is True
 
+    # Renaming the target to the fix note's own words is not a new target.
+    # This one reached publication as "verify the label is center-aligned"
+    # because it no longer matched the module, so the novelty rule was skipped.
+    renamed = summarize_tr.deterministic_direct_fix_basis(
+        "Existing editor", "Tapping Create another one",
+        "Always returns to the Custom tab", ["A"], evidence_map,
+    )
+    assert renamed["supported"] is False
+    assert renamed["targets_source_module"] is False
+    assert renamed["novel_claim_terms"] == []
+    assert renamed["novel_term_minimum"] == 1
+
 
 def test_disconfirming_observation_accepts_any_observable_outcome():
     """A curated adjective list rejected valid phrasings like "remains selected"."""
@@ -2433,6 +2517,505 @@ def test_generalization_support_requires_the_claim_to_invoke_the_family():
         }],
     )
     assert no_family["supported"] is False
+
+
+def test_handler_counts_as_a_stated_generalization_family_noun():
+    """An RD who routes "every ... handler" has stated a family, same as "path".
+
+    Real fix note from DRI261885-0042. Without "handler" in the family nouns
+    the exception never fired, and the run's only genuine neighbour had no
+    route to publication: the target gate demands the adjacent area's own name
+    in the quote, and a shared error handler by definition does not name the
+    other features hanging off it.
+    """
+    refs = [{
+        "bug_code": "A", "signal_index": 0,
+        "quote": (
+            "Route every long-task error handler through one shared message: "
+            '"Credits have been refunded. Please try again later."'
+        ),
+    }]
+    supported = summarize_tr.deterministic_generalization_support_basis(
+        "Image to Video generation failure message",
+        'Let an Image to Video long-task generation fail, then tap "View Details"',
+        "The fix routes every long-task error handler through one shared "
+        "refunded message, so another long-task handler emits it too",
+        refs,
+    )
+    assert supported["supported"] is True
+    assert supported["family_matches"][0]["family_phrase"] == (
+        "every long-task error handler"
+    )
+
+    # The family noun alone still does not carry a claim that never invokes it.
+    unrelated = summarize_tr.deterministic_generalization_support_basis(
+        "Audio denoise", "Export a project",
+        "Denoise shares the export pipeline", refs,
+    )
+    assert unrelated["supported"] is False
+
+
+# Real DRI261885-0042 fix note. The family phrase sits in the solution, at
+# signal 1; the root cause the model cited is signal 0.
+_HANDLER_ROOT_CAUSE = (
+    "Error codes 6000 and 6008 currently show different code-specific refund "
+    "details, which do not match the specified video-generation failure message."
+)
+_HANDLER_SOLUTION = (
+    'Route every long-task error handler through one shared message: '
+    '"Credits have been refunded. Please try again later."'
+)
+
+
+def _handler_evidence_map():
+    return {"A": {
+        "summary": (
+            "Character Motion Swap: when video generation fails after a long "
+            "wait, the displayed message does not match the spec."
+        ),
+        "repro_or_description": (
+            "Repro Steps: 1. Launch App 2. Go to [ Template ] 3. Start "
+            'generating and wait 4. Tap "View Details" after generation fails.'
+        ),
+        "parsed_module": "Character Motion Swap",
+        "evidence_quality": "high",
+        "adjacency_signal_quotes": [_HANDLER_ROOT_CAUSE, _HANDLER_SOLUTION],
+    }}
+
+
+def test_completion_reaches_a_family_phrase_the_model_left_uncited():
+    """Target completion's gate closed the only route to the family phrase.
+
+    A model that cites the root cause and paraphrases the solution leaves the
+    family phrase uncited. `deterministic_generalization_support_basis` reads
+    only cited quotes, so the override could not fire — and completion could
+    not supply the quote either, because it ran only when the target was
+    *unsupported*, which is exactly when this claim is well formed. The run for
+    16.7.5.188935 recorded "no_stated_generalization_family_invoked", which
+    reads the same as a model that never generalized at all.
+    """
+    evidence_map = _handler_evidence_map()
+    area = "Image to Video generation failure message"
+    trigger = 'Let an Image to Video long-task generation fail, then tap "View Details"'
+    rationale = (
+        "The fix routes every long-task error handler through one shared "
+        "refunded message, so another long-task handler emits it too"
+    )
+    cited = [{"bug_code": "A", "signal_index": 0, "quote": _HANDLER_ROOT_CAUSE}]
+
+    # The target is already anchored by the cited quote, so target completion
+    # has nothing to do; the family phrase still has to arrive.
+    assert summarize_tr.deterministic_adjacency_support_basis(
+        area, cited,
+    )["supported"] is True
+    assert summarize_tr.deterministic_generalization_support_basis(
+        area, trigger, rationale, cited,
+    )["supported"] is False
+
+    refs, basis = summarize_tr.deterministic_evidence_ref_completion(
+        area, ["A"], cited, evidence_map, max_refs=4,
+        trigger=trigger, rationale=rationale,
+    )
+    assert basis["status"] == "not_needed"
+    assert basis["generalization_status"] == "completed_from_candidate_bug_signal"
+    assert [ref["signal_index"] for ref in basis[
+        "added_generalization_evidence_refs"
+    ]] == [1]
+    assert basis["added_target_evidence_refs"] == []
+    assert basis["initial_generalization_supported"] is False
+    assert basis["final_generalization_supported"] is True
+    assert summarize_tr.deterministic_generalization_support_basis(
+        area, trigger, rationale, refs,
+    )["supported"] is True
+
+    # It never leaves the candidate's own BugCodes, and a claim that invokes no
+    # family gains nothing from the same evidence.
+    _, no_family = summarize_tr.deterministic_evidence_ref_completion(
+        area, ["A"], cited, evidence_map, max_refs=4,
+        trigger=trigger, rationale="Both surfaces are risky",
+    )
+    assert no_family["generalization_status"] == (
+        "no_stated_generalization_family_in_candidate_bugcodes"
+    )
+    assert no_family["added_evidence_refs"] == []
+
+
+def test_uncited_family_phrase_reaches_the_override_end_to_end(monkeypatch):
+    """The whole point of completing the ref: the override can now fire."""
+    data = {"products": {"P": [{
+        "BugCode": "A",
+        "Short Description": (
+            "Character Motion Swap: the video generation failure message does "
+            "not match the spec"
+        ),
+        "ReproSteps": 'Start generating, wait, then tap "View Details"',
+        "Resolutions": [{
+            "root_cause": _HANDLER_ROOT_CAUSE,
+            "solution": _HANDLER_SOLUTION,
+        }],
+    }]}}
+    area = "Image to Video generation failure message"
+    candidate = {
+        "area": area,
+        "target_category": summarize_tr.UNKNOWN_TARGET_CATEGORY,
+        "trigger": (
+            'Let an Image to Video long-task generation fail, then tap '
+            '"View Details"'
+        ),
+        "expected_failure_mode": (
+            "The failure message still shows a code-specific refund detail"
+        ),
+        **_prediction_boundaries(area),
+        "action": (
+            'Verify the Image to Video failure message after tapping '
+            '"View Details"'
+        ),
+        "rationale": (
+            "The fix routes every long-task error handler through one shared "
+            "refunded message, so another long-task handler emits it too"
+        ),
+        "source_bug_codes": ["A"],
+        # The model cites the root cause; the family phrase sits uncited at 1.
+        "evidence_refs": [{"bug_code": "A", "signal_index": 0}],
+        "historical_analog_refs": [],
+        "confidence": "medium",
+    }
+    monkeypatch.setattr(
+        summarize_tr, "call_ollama_json",
+        _generalization_fake_json(candidate, ["target_supported"]),
+    )
+    analysis = generate_structured_analysis(data, "model", "url", 10)
+
+    assert analysis["candidate_grounding_audit"][
+        "generalization_target_override_count"
+    ] == 1
+    assert len(analysis["recommendations"]) == 1
+    recommendation = analysis["recommendations"][0]
+    completion = analysis["candidate_grounding_audit"][
+        "candidate_discovery_audit"
+    ]["adjacency_gate_supported_candidates"][0]["candidate"][
+        "evidence_ref_completion_basis"
+    ]
+    assert completion["generalization_status"] == (
+        "completed_from_candidate_bug_signal"
+    )
+    assert [ref["signal_index"] for ref in recommendation["evidence_refs"]] == [
+        0, 1,
+    ]
+    assert recommendation["generalization_support_basis"]["supported"] is True
+    assert process_tr.structured_prediction_errors(analysis) == []
+
+
+def test_completion_keeps_the_pre_schema40_basis_without_the_claim_text():
+    """Stored reports predate the scan and must still revalidate byte for byte."""
+    legacy_refs, legacy = summarize_tr.deterministic_evidence_ref_completion(
+        "Image to Video generation failure message", ["A"],
+        [{"bug_code": "A", "signal_index": 0, "quote": _HANDLER_ROOT_CAUSE}],
+        _handler_evidence_map(), max_refs=4,
+    )
+    assert legacy["schema_version"] == 1
+    assert legacy["policy"] == (
+        "bounded_candidate_bug_target_reference_completion_v1"
+    )
+    assert len(legacy_refs) == 1
+    assert not [key for key in legacy if "generalization" in key]
+
+
+def _floor_evidence(module, category, analogs):
+    return {
+        "bug_code": "A",
+        "parsed_module": module,
+        "module_category": category,
+        "historical_analogs": analogs,
+    }
+
+
+def test_coverage_floor_always_gives_every_uncovered_bug_somewhere_to_start():
+    """A report whose regression section is empty leaves QA nowhere to begin.
+
+    The gates are right to withhold a fix restatement, but "nothing" is not an
+    answer. The fixed surface itself is always available — a report exists only
+    because a bug was fixed — so the floor can never be empty.
+    """
+    floor = summarize_tr.deterministic_regression_coverage_floor(
+        [_floor_evidence("Character Motion Swap", "AI Features", [])], [],
+    )
+    assert floor["entry_count"] == 1
+    assert floor["uncovered_bug_codes"] == ["A"]
+    entry = floor["entries"][0]
+    assert entry["basis"] == "fixed_surface"
+    assert "Character Motion Swap" in entry["action"]
+    # It is coverage, not a claim: nothing here may read as a graded prediction.
+    assert floor["is_adjacency_prediction"] is False
+    assert floor["influences_confidence"] is False
+    assert floor["influences_risk"] is False
+    assert floor["influences_priority"] is False
+    assert floor["enters_prior_hypothesis_scoring"] is False
+    assert not {"confidence", "risk", "priority_rank"} & set(entry)
+
+    # A bug a published recommendation already covers is not restated.
+    covered = summarize_tr.deterministic_regression_coverage_floor(
+        [_floor_evidence("Character Motion Swap", "AI Features", [])],
+        [{"source_bug_codes": ["A"]}],
+    )
+    assert covered["entries"] == []
+
+    # The guarantee is per bug and survives missing module metadata: with no
+    # parsed module the BugCode itself names the surface.
+    bare = summarize_tr.deterministic_regression_coverage_floor(
+        [_floor_evidence("", "", [])], [],
+    )
+    assert bare["entry_count"] == 1
+    assert bare["entries"][0]["area"] == "A"
+
+    # One covered bug does not silence an uncovered sibling.
+    mixed = summarize_tr.deterministic_regression_coverage_floor(
+        [
+            _floor_evidence("Character Motion Swap", "AI Features", []),
+            {**_floor_evidence("Timeline", "Editing", []), "bug_code": "B"},
+        ],
+        [{"source_bug_codes": ["A"]}],
+    )
+    assert [entry["source_bug_code"] for entry in mixed["entries"]] == ["B"]
+
+
+def test_coverage_floor_does_not_send_qa_back_to_the_module_it_just_checked():
+    """Real analogs for DRI261885-0042 were both in the module that was fixed.
+
+    Comparing module strings let "Character Motion Swap" past a fixed module of
+    "Character Motion Swap - REDRED", producing two rows telling QA to go and
+    regress the surface the fixed-surface row already names.
+    """
+    analogs = [
+        {
+            "bug_code": "DRI251809-0054", "module": "Character Motion Swap",
+            "module_category": "AI Features", "relationship": "same_module",
+            "summary": "Watermark shown for free users",
+            "similarity_score": 0.44, "overlap_terms": ["video"],
+        },
+        {
+            "bug_code": "DRI251818-0019", "module": "Character Motion Swap",
+            "module_category": "AI Features", "relationship": "same_module",
+            "summary": "Example photo is not 9:16",
+            "similarity_score": 0.41, "overlap_terms": ["spec"],
+        },
+    ]
+    floor = summarize_tr.deterministic_regression_coverage_floor(
+        [_floor_evidence("Character Motion Swap - REDRED", "AI Features", analogs)],
+        [],
+    )
+    assert [entry["basis"] for entry in floor["entries"]] == ["fixed_surface"]
+    entry = floor["entries"][0]
+    # The analogs are not discarded, just attributed to the right surface.
+    assert [ref["analog_bug_code"] for ref in entry["historical_analog_refs"]] == [
+        "DRI251809-0054", "DRI251818-0019",
+    ]
+    assert "DRI251809-0054, DRI251818-0019" in entry["why"]
+
+
+def test_coverage_floor_groups_genuinely_adjacent_modules_once_each():
+    analogs = [
+        {
+            "bug_code": "B1", "module": "Text to Video",
+            "module_category": "AI Features",
+            "relationship": "same_category_adjacent_module",
+            "summary": "Prompt box issue", "similarity_score": 0.5,
+            "overlap_terms": ["prompt"],
+        },
+        {
+            "bug_code": "B2", "module": "Text to Video",
+            "module_category": "AI Features",
+            "relationship": "same_category_adjacent_module",
+            "summary": "Another prompt box issue", "similarity_score": 0.4,
+            "overlap_terms": ["generation"],
+        },
+        {
+            "bug_code": "B3", "module": "Audio Denoise",
+            "module_category": "Audio",
+            "relationship": "same_category_adjacent_module",
+            "summary": "Denoise issue", "similarity_score": 0.3,
+            "overlap_terms": ["audio"],
+        },
+    ]
+    floor = summarize_tr.deterministic_regression_coverage_floor(
+        [_floor_evidence("Character Motion Swap", "AI Features", analogs)], [],
+    )
+    areas = [entry["area"] for entry in floor["entries"]]
+    assert areas == ["Text to Video", "Audio Denoise", "Character Motion Swap"]
+    text_to_video = floor["entries"][0]
+    assert [
+        ref["analog_bug_code"] for ref in text_to_video["historical_analog_refs"]
+    ] == ["B1", "B2"]
+    assert "prompt" in text_to_video["why"]
+    assert "generation" in text_to_video["why"]
+    assert text_to_video["grounding"] == (
+        "historical_co_occurrence_not_current_fix"
+    )
+
+
+def test_empty_regression_section_still_ships_a_usable_report():
+    """The section the gates emptied is no longer the whole report.
+
+    Baseline Coverage sits after the checklists and outside the graded
+    recommendation grammar on purpose: `validate_report` must keep reading the
+    regression section as "nothing grounded", not mistake an unrated row for a
+    risk-ranked recommendation.
+    """
+    data = {"products": {"P": [{"BugCode": "A"}]}}
+    analysis = {
+        "recommendations": [],
+        "checklists": [{
+            "bug_code": "A", "steps": ["Open the app", "Verify the message"],
+            "evidence_quality": "high", "evidence_gaps": [],
+        }],
+        "regression_coverage_floor": (
+            summarize_tr.deterministic_regression_coverage_floor(
+                [_floor_evidence("Character Motion Swap", "AI Features", [])],
+                [],
+            )
+        ),
+    }
+    report = render_analysis_markdown(analysis)
+
+    assert validate_report(report, data, 0) == []
+    regression, _ = summarize_tr.split_report_sections(report)
+    assert regression.strip() == summarize_tr.NO_GROUNDED_REGRESSION
+    assert "# Baseline Coverage" in report
+    assert "Character Motion Swap" in report.split("# Baseline Coverage")[1]
+    assert "Not adjacency predictions and not rated" in report
+
+    # With nothing to say, no empty heading is emitted.
+    bare = render_analysis_markdown({
+        **analysis, "regression_coverage_floor": {"entries": []},
+    })
+    assert "# Baseline Coverage" not in bare
+    assert validate_report(bare, data, 0) == []
+
+
+def _family_member_target_data():
+    return {"products": {"P": [{
+        "BugCode": "A",
+        "Short Description": (
+            "Character Motion Swap: the video generation failure message does "
+            "not match the spec"
+        ),
+        "ReproSteps": (
+            'Start generating, wait, then tap "View Details" and read the '
+            "refunded message"
+        ),
+        "ParsedModule": "Character Motion Swap",
+        "Resolutions": [{"solution": _HANDLER_SOLUTION}],
+    }]}}
+
+
+def _family_member_candidate():
+    area = "Text to Image generation"
+    return {
+        "area": area,
+        "target_category": summarize_tr.UNKNOWN_TARGET_CATEGORY,
+        "trigger": (
+            "Let a Text to Image long-task generation fail, then read the "
+            "refunded message"
+        ),
+        "expected_failure_mode": (
+            "The Text to Image failure dialog shows a code-specific refund "
+            "detail"
+        ),
+        **_prediction_boundaries(area),
+        "action": "Verify the Text to Image failure dialog after a failed run",
+        "rationale": (
+            "The fix routes every long-task error handler through one shared "
+            "refunded message, so this handler emits it too"
+        ),
+        "source_bug_codes": ["A"],
+        "evidence_refs": [{"bug_code": "A", "signal_index": 0}],
+        "historical_analog_refs": [],
+        "confidence": "medium",
+    }
+
+
+def test_family_member_target_survives_the_deterministic_gate(monkeypatch):
+    """The override was applied only after the critic the draft never reached.
+
+    A fix that routes "every long-task error handler" through one message
+    cannot name the other features hanging off that handler, so the lexical
+    target test fails by construction — which is the whole reason the
+    generalization override exists. It lived in `_partition_grounding_audits`,
+    downstream of an adjacency gate that had already withheld the draft for
+    exactly the check the override answers, so it could never fire.
+    """
+    candidate = _family_member_candidate()
+    monkeypatch.setattr(
+        summarize_tr, "call_ollama_json",
+        _generalization_fake_json(candidate, ["target_supported"]),
+    )
+    analysis = generate_structured_analysis(
+        _family_member_target_data(), "model", "url", 10,
+    )
+    discovery = analysis["candidate_grounding_audit"][
+        "candidate_discovery_audit"
+    ]
+
+    assert discovery["adjacency_gate_withheld_count"] == 0
+    assert discovery["adjacency_gate_supported_count"] == 1
+    assert len(analysis["recommendations"]) == 1
+    recommendation = analysis["recommendations"][0]
+    assert recommendation["area"] == "Text to Image generation"
+    # The lexical target test still fails; only the family override carries it.
+    assert recommendation["adjacency_support_basis"]["supported"] is False
+    assert recommendation["generalization_support_basis"]["supported"] is True
+    assert analysis["candidate_grounding_audit"][
+        "generalization_target_override_count"
+    ] == 1
+    # A published claim must survive revalidation in the other process too.
+    assert process_tr.structured_prediction_errors(analysis) == []
+
+
+def test_family_override_does_not_rescue_a_direct_fix_restatement(monkeypatch):
+    """It overrides the target check only, exactly as it does after the critic.
+
+    This claim invokes the same stated family and would take the override, but
+    every term it uses comes from the bug it cites — it is the fix restated
+    under a family banner, and the restatement gate still withholds it.
+    """
+    area = "Video generation failure"
+    candidate = {
+        **_family_member_candidate(),
+        "area": area,
+        "trigger": "Start generating, wait, then read the refunded message",
+        "expected_failure_mode": (
+            "The refunded message does not match the spec"
+        ),
+        **_prediction_boundaries(area),
+        "action": "Verify the refunded message after a failed generation",
+        "rationale": (
+            "The fix routes every long-task error handler through one shared "
+            "refunded message"
+        ),
+    }
+    monkeypatch.setattr(
+        summarize_tr, "call_ollama_json",
+        _generalization_fake_json(candidate, ["target_supported"]),
+    )
+    analysis = generate_structured_analysis(
+        _family_member_target_data(), "model", "url", 10,
+    )
+    discovery = analysis["candidate_grounding_audit"][
+        "candidate_discovery_audit"
+    ]
+    assert discovery["adjacency_gate_supported_count"] == 0
+    assert discovery["adjacency_gate_withheld_count"] == 1
+    withheld = discovery["adjacency_gate_withheld_candidates"][0]
+    assert withheld["reason"] == "direct_fix_restatement"
+    assert withheld["failed_checks"] == ["adjacent_not_direct_fix"]
+    # The override did apply to the target check; it simply does not reach the
+    # restatement check.
+    assert withheld["candidate"]["generalization_target_override"] is True
+    assert withheld["candidate"][
+        "adjacency_support_basis"
+    ]["supported"] is False
+    assert analysis["recommendations"] == []
+    assert process_tr.structured_prediction_errors(analysis) == []
 
 
 def test_code_shaped_fix_notes_carry_adjacency_evidence():
@@ -3284,7 +3867,7 @@ def test_schema23_prioritizes_and_suppresses_grounded_coverage_equivalents(
     analysis = generate_structured_analysis(data, "model", "url", 10)
     audit = analysis["candidate_grounding_audit"]
 
-    assert analysis["schema_version"] == 38
+    assert analysis["schema_version"] == 40
     assert audit_calls == 2
     assert audit["synthesized_recommendation_count"] == 3
     assert audit["duplicate_final_recommendation_count"] == 0
@@ -4594,6 +5177,8 @@ def test_new_cohort_publishes_prior_hypothesis_evaluation(tmp_path, monkeypatch)
             recommendation["source_bug_codes"],
             recommendation["evidence_refs"],
             evidence_map,
+            trigger=recommendation["trigger"],
+            rationale=recommendation["rationale"],
         )
         recommendation["shared_path_support_basis"] = (
             summarize_tr.deterministic_shared_path_support_basis(
@@ -5154,6 +5739,163 @@ def test_hypothesis_id_is_stable_and_target_sensitive():
         ),
     }
     assert summarize_tr.stable_hypothesis_id(changed_boundary) != first
+
+
+def _withheld_prior(gate_drafts=(), critic_drafts=()):
+    return {
+        "generated_at": "2026-09-09T00:00:00+00:00",
+        "recommendations": [],
+        "candidate_grounding_audit": {
+            "candidate_discovery_audit": {
+                "adjacency_gate_withheld_candidates": list(gate_drafts),
+            },
+            "withheld_candidates": list(critic_drafts),
+        },
+    }
+
+
+def test_withheld_drafts_are_scored_when_the_prior_report_published_nothing():
+    """A build that published nothing still leaves evidence about its gates.
+
+    This is the real 16.7.5.188873 → 16.7.5.188935 shape: five drafts declined
+    for the same check, all in AI Features, and the next build's only bug in
+    AI Features. Discarding them left the retrospective permanently at 0 of 0,
+    unable to report even that the bar had stopped five drafts in the one
+    category that went on to fail.
+    """
+    gate_drafts = [
+        {
+            "candidate_id": f"TRC-00000000000{index}",
+            "reason": "adjacent_target_absent_from_current_signal",
+            "failed_checks": ["target_supported"],
+            "candidate": {
+                "area": area, "target_category": "AI Features",
+                "trigger": f"Open {area}",
+                "expected_failure_mode": f"{area} renders stale output",
+            },
+        }
+        for index, area in enumerate(
+            ["Text to Image", "Text to Image", "AI Model List"], start=1
+        )
+    ]
+    current = {"products": {"P": [{
+        "BugCode": "DRI261885-0042",
+        "ModuleCategory": "AI Features",
+        "ParsedModule": "Character Motion Swap - REDRED",
+        "Short Description": "Character Motion Swap failure message is wrong",
+    }]}}
+    result = process_tr.evaluate_prior_hypotheses(
+        _withheld_prior(gate_drafts), current,
+        prior_close_build="16.7.5.188873",
+        current_close_build="16.7.5.188935",
+    )
+
+    # The published-prediction scoring is untouched: nothing was predicted.
+    assert result["category_evaluable_hypothesis_count"] == 0
+    assert result["category_overlap_count"] == 0
+    assert result["hypotheses"] == []
+
+    retro = result["withheld_draft_retrospective"]
+    assert retro["is_prediction_scoring"] is False
+    assert retro["purpose"] == "gate_tuning_signal"
+    assert retro["withheld_draft_count"] == 3
+    assert retro["category_evaluable_count"] == 3
+    assert retro["category_overlap_count"] == 3
+    # Category matched; the failing feature did not. That distinction is the
+    # whole value of the row — an overlap here is not a miss.
+    assert retro["feature_candidate_count"] == 0
+    assert {row["result"] for row in retro["drafts"]} == {"category_overlap"}
+    # Three rows, two places: counting rows would overstate the finding.
+    assert retro["distinct_overlap_areas"] == ["AI Model List", "Text to Image"]
+    assert retro["overlap_failed_check_counts"] == {"target_supported": 3}
+    assert retro["withheld_reason_counts"] == {
+        "adjacent_target_absent_from_current_signal": 3
+    }
+    assert retro["drafts"][0]["observed_bug_codes"] == ["DRI261885-0042"]
+    assert retro["drafts"][0]["stage"] == "deterministic_evidence_gate"
+
+
+def test_withheld_draft_check_reports_a_feature_match_when_the_area_matches():
+    """An overlap becomes a real signal only when the failing feature matches."""
+    gate_drafts = [{
+        "candidate_id": "TRC-000000000001",
+        "reason": "adjacent_target_absent_from_current_signal",
+        "failed_checks": ["target_supported"],
+        "candidate": {
+            "area": "Character Motion Swap",
+            "target_category": "AI Features",
+            "trigger": "Start a Character Motion Swap generation and let it fail",
+            "expected_failure_mode": (
+                "The Character Motion Swap failure message does not match the spec"
+            ),
+        },
+    }]
+    current = {"products": {"P": [{
+        "BugCode": "DRI261885-0042",
+        "ModuleCategory": "AI Features",
+        "ParsedModule": "Character Motion Swap",
+        "Short Description": (
+            "Character Motion Swap: the failure message does not match the spec"
+        ),
+        "ReproSteps": "Start generating and let it fail",
+    }]}}
+    retro = process_tr.evaluate_prior_hypotheses(
+        _withheld_prior(gate_drafts), current,
+        prior_close_build="a", current_close_build="b",
+    )["withheld_draft_retrospective"]
+    assert retro["feature_candidate_count"] == 1
+    assert retro["drafts"][0]["result"] == "feature_match_candidate"
+    assert retro["drafts"][0]["feature_match_candidates"]
+
+
+def test_withheld_draft_check_covers_both_gates_and_stays_empty_when_it_should():
+    critic_drafts = [{
+        "candidate_id": "TRC-000000000009",
+        "reason": "shared_path_not_concrete",
+        "failed_checks": ["shared_path_concrete"],
+        "area": "Timeline preview",
+        "target_category": "Editing",
+        "trigger": "Open Timeline preview",
+        "expected_failure_mode": "Timeline preview is stale",
+    }]
+    current = {"products": {"P": [
+        {"BugCode": "N-1", "ModuleCategory": "AI Features"},
+    ]}}
+    retro = process_tr.evaluate_prior_hypotheses(
+        _withheld_prior(critic_drafts=critic_drafts), current,
+        prior_close_build="a", current_close_build="b",
+    )["withheld_draft_retrospective"]
+    assert retro["withheld_draft_count"] == 1
+    assert retro["drafts"][0]["stage"] == "model_grounding_audit"
+    # Its category produced no bug here, so there is no signal to report.
+    assert retro["category_overlap_count"] == 0
+    assert retro["drafts"][0]["result"] == "not_observed_in_current_cohort"
+    assert retro["overlap_failed_check_counts"] == {}
+
+    # A cross-cutting target cannot be scored by category at all.
+    cross_cutting = [{
+        "candidate_id": "TRC-00000000000A", "reason": "x", "failed_checks": [],
+        "candidate": {
+            "area": "Shared service",
+            "target_category": summarize_tr.UNKNOWN_TARGET_CATEGORY,
+            "trigger": "t", "expected_failure_mode": "f",
+        },
+    }]
+    unscorable = process_tr.evaluate_prior_hypotheses(
+        _withheld_prior(cross_cutting), current,
+        prior_close_build="a", current_close_build="b",
+    )["withheld_draft_retrospective"]
+    assert unscorable["category_evaluable_count"] == 0
+    assert unscorable["drafts"][0]["result"] == "unscorable_cross_cutting"
+
+    # A prior report with no withheld drafts reports nothing rather than zeroes
+    # that look like a measurement.
+    none_withheld = process_tr.evaluate_prior_hypotheses(
+        _withheld_prior(), current,
+        prior_close_build="a", current_close_build="b",
+    )["withheld_draft_retrospective"]
+    assert none_withheld["withheld_draft_count"] == 0
+    assert none_withheld["drafts"] == []
 
 
 def test_prior_hypothesis_evaluation_is_coarse_category_overlap_only():
@@ -7720,3 +8462,178 @@ def test_valid_candidate_batch_records_no_drops(monkeypatch):
         "prompt", lambda given: (list(given["candidates"]), []),
         "model", "url", 1, num_predict=10,
     ) == ([{"area": "Timeline"}], 0, [])
+
+
+def _restatement_evidence_map():
+    return {
+        "B1": {
+            "parsed_module": "AI Music Generator",
+            "summary": (
+                "AI Music Generator (Artwork): The playhead cannot be dragged"
+            ),
+            "repro_or_description": (
+                "The playhead cannot be dragged during playback."
+            ),
+            "adjacency_signal_quotes": [
+                "Keep the waveform visible and correctly bounded throughout "
+                "playback. Allow users to seek reliably by dragging either "
+                "the waveform or playhead."
+            ],
+        }
+    }
+
+
+def test_candidate_prompt_states_the_novelty_floors_the_gate_enforces():
+    """The prompt must quote the real floors, or the model cannot self-filter.
+
+    Every draft in the 16.8.0.189063 run was withheld as a restatement because
+    the prompt said only "do not restate the direct fix" without naming the
+    word-count test the deterministic gate actually applies.
+    """
+    prompt = summarize_tr._candidate_prompt(
+        [{"bug_code": "B1"}], ["Audio"]
+    )
+    same_module = summarize_tr.deterministic_direct_fix_basis(
+        "AI Music Generator", "Generate songs",
+        "Playhead cannot be dragged after generating songs",
+        ["B1"], _restatement_evidence_map(),
+    )
+    other_module = summarize_tr.deterministic_direct_fix_basis(
+        "Timeline ruler", "Generate songs",
+        "Playhead cannot be dragged after generating songs",
+        ["B1"], _restatement_evidence_map(),
+    )
+
+    assert same_module["novel_term_minimum"] == 2
+    assert other_module["novel_term_minimum"] == 1
+    assert "at\nleast TWO words must survive" in prompt
+    assert "names a different module, at least ONE" in prompt
+
+
+def test_candidate_prompt_worked_example_matches_the_gate_verdicts():
+    """The example must be true, or it teaches the model the wrong rule."""
+    evidence_map = _restatement_evidence_map()
+    restatement = summarize_tr.deterministic_direct_fix_basis(
+        "AI Music Generator", "Generate songs",
+        "Playhead cannot be dragged after generating songs",
+        ["B1"], evidence_map,
+    )
+    adjacent = summarize_tr.deterministic_direct_fix_basis(
+        "AI Music Generator", "Seek within a generated song",
+        "Waveform zoom level resets after seeking",
+        ["B1"], evidence_map,
+    )
+
+    assert restatement["supported"] is False
+    assert restatement["rule"] == "restates_the_cited_fix"
+    assert adjacent["supported"] is True
+    # The prompt tells the model "waveform" does not survive because the fix
+    # note already used it; the surviving terms are the zoom-level ones.
+    assert "waveform" not in adjacent["novel_claim_terms"]
+    assert {"zoom", "level", "resets"} <= set(adjacent["novel_claim_terms"])
+
+
+def test_candidate_prompt_requires_the_area_wording_the_validator_checks():
+    """Sub-element phrasing fails mentions_target_area, so say so in the prompt."""
+    prompt = summarize_tr._candidate_prompt(
+        [{"bug_code": "B1"}], ["Audio"]
+    )
+    area = "AI Music Generator"
+    sub_element_only = (
+        "If the favorite page still lists the deleted song, lower this hypothesis"
+    )
+    names_the_area = (
+        "If the AI Music Generator favorite page still lists the deleted "
+        "song, lower this hypothesis"
+    )
+
+    assert summarize_tr.mentions_target_area(area, sub_element_only) is False
+    assert summarize_tr.mentions_target_area(area, names_the_area) is True
+    assert "means the literal text of your area field" in prompt
+    assert "at least one word of four or more characters" in prompt
+
+
+def test_coverage_challenge_pass_inherits_the_restatement_rules():
+    """The challenge pass appends the candidate prompt, so it must carry both."""
+    challenge = summarize_tr._coverage_challenge_prompt(
+        [{"bug_code": "B1"}],
+        [{
+            "area": "AI Music Generator",
+            "target_category": "Audio",
+            "trigger": "t",
+            "expected_failure_mode": "f",
+            "scope_boundary": "b",
+            "disconfirming_observation": "d",
+            "action": "a",
+            "source_bug_codes": ["B1"],
+        }],
+        ["Audio"],
+    )
+
+    assert "at\nleast TWO words must survive" in challenge
+    assert "means the literal text of your area field" in challenge
+
+
+def test_bug_block_states_the_module_and_category():
+    """The narrative report must use the same vocabulary as the taxonomy.
+
+    structured_bug_evidence already carries ParsedModule / ModuleCategory to
+    the structured analysis. Without them in the prompt the narrative report
+    infers the area from the summary text, and the two disagree in practice:
+    DRI261886-0057 reads "Cinematic Reel Creator" in its title while the
+    taxonomy files it under module "Creator Music", category "Audio".
+    """
+    block = summarize_tr.build_bug_block({
+        "BugCode": "DRI261886-0057",
+        "Short Description": "PDR-I 16.8.0 - [MUI] Cinematic Reel Creator: not localized",
+        "ParsedModule": "Creator Music",
+        "ModuleCategory": "Audio",
+        "Resolutions": [], "VerifyComments": [],
+    }, 500)
+    assert "- Module: Creator Music | Category: Audio" in block
+
+
+def test_bug_block_omits_the_module_line_when_unmapped():
+    block = summarize_tr.build_bug_block({
+        "BugCode": "DRI261890-0001", "Short Description": "x",
+        "Resolutions": [], "VerifyComments": [],
+    }, 500)
+    assert "- Module:" not in block
+
+
+def test_analysis_source_hash_is_stable_across_processes():
+    """The parent hashes in-process; the summarizer re-hashes in a subprocess.
+
+    A set iterated without a total order resolves differently per hash seed and
+    breaks that cross-check, which is what casefold_order exists to prevent.
+    """
+    import subprocess as _sp
+    details = {
+        "meta": {
+            "module_category_taxonomy": [
+                {"category": "Audio", "modules": ["PIP", "PiP", "Creator Music"]},
+            ],
+            # Not part of the hashed payload; present to prove they stay out.
+            "tr_context": {"testing_requests": [{"tr_code": "TR260910-067"}]},
+            "cohort_audit": {"missing_from_cohort": []},
+        },
+        "products": {"P": [
+            {"BugCode": "A", "Short Description": "s", "Resolutions": [],
+             "VerifyComments": [], "ParsedModule": "PiP", "ModuleCategory": "Audio"},
+        ]},
+    }
+    payload = json.dumps(details)
+    script = (
+        "import sys, json; sys.path.insert(0, '.');"
+        "from scripts.process_newest_tr import analysis_source_hash;"
+        "print(analysis_source_hash(json.loads(sys.stdin.read()))[0])"
+    )
+    hashes = set()
+    for seed in ("0", "1", "12345"):
+        proc = _sp.run([sys.executable, "-c", script], input=payload,
+                       capture_output=True, text=True,
+                       env={"PYTHONHASHSEED": seed, "PATH": os.environ.get("PATH", "")})
+        assert proc.returncode == 0, proc.stderr
+        hashes.add(proc.stdout.strip())
+    assert len(hashes) == 1, f"hash varies with PYTHONHASHSEED: {hashes}"
+    assert hashes.pop() == process_tr.analysis_source_hash(details)[0]

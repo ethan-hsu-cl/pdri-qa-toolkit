@@ -106,12 +106,51 @@ import plotly.express as px
 from pathlib import Path
 
 try:
+    from summarize_tr_bugs import NO_GROUNDED_REGRESSION
+except ImportError:
+    from scripts.summarize_tr_bugs import NO_GROUNDED_REGRESSION
+
+try:
+    from ecl_links import (
+        ECL_BUG_URL, bug_link, link_column_values, linkify_bug_codes, tr_url,
+    )
+except ImportError:
+    from scripts.ecl_links import (
+        ECL_BUG_URL, bug_link, link_column_values, linkify_bug_codes, tr_url,
+    )
+
+try:
     from tr_focus_view import (
-        checklist_label, prior_comparison_context, render_recommendation_groups,
+        checklist_label, collect_changesets, collect_version_fixes,
+        build_focus_list, focus_list_is_current, focus_list_markdown,
+        prior_comparison_context, render_cohort_provenance,
+        render_recommendation_groups,
+    )
+    from tr_at_cases import (
+        AT_REPOS, at_cases_for_focus, at_repo_dir, configured_at_dir,
+        index_at_suites, pytest_commands, save_at_repo_dir,
     )
 except ImportError:
     from scripts.tr_focus_view import (
-        checklist_label, prior_comparison_context, render_recommendation_groups,
+        checklist_label, collect_changesets, collect_version_fixes,
+        build_focus_list, focus_list_is_current, focus_list_markdown,
+        prior_comparison_context, render_cohort_provenance,
+        render_recommendation_groups,
+    )
+    from scripts.tr_at_cases import (
+        AT_REPOS, at_cases_for_focus, at_repo_dir, configured_at_dir,
+        index_at_suites, pytest_commands, save_at_repo_dir,
+    )
+
+try:
+    from tr_history import (
+        DEFAULT_HISTORY_DAYS, current_run_dir, history_digest, run_focus_list,
+        run_history,
+    )
+except ImportError:
+    from scripts.tr_history import (
+        DEFAULT_HISTORY_DAYS, current_run_dir, history_digest, run_focus_list,
+        run_history,
     )
 
 
@@ -215,8 +254,6 @@ if st.session_state.get("_product_switched_notice"):
 # Constants
 # ---------------------------------------------------------------------
 
-ECL_BUG_URL = "https://ecl.cyberlink.com/Ebug/eBugHandle/HandleMainEbug2.asp?BugCode={bug_code}"
-
 QUADRANT_COLORS = {
     "P1 - Critical": "#ef4444",
     "P2 - High":     "#f97316",
@@ -316,6 +353,56 @@ def normalise_module(name: str) -> str:
     name = re.sub(r'\s*\[[^\]]*\]\s*', ' ', name)
     name = re.sub(r' +', ' ', name).strip()
     return name
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_at_index(repo: str) -> list:
+    """AT_PDRi's files and cases; the SFT files run to 8,000 lines each."""
+    return index_at_suites(Path(repo))
+
+
+def show_dataframe(data, **kwargs):
+    """``st.dataframe``, with any bug-code column rendered as an eCL link.
+
+    Bug codes reach tables from a dozen call sites — risk drill-downs, cohort
+    listings, prediction scoring, the Stage 8 diagnostics — and asking each one
+    to remember a ``LinkColumn`` is how most of them ended up plain text. This
+    decides from the data instead: a column is linked when every value in it is
+    a single BugCode, so ``Source bug`` and ``analog_bug_code`` link without
+    being named here, and a free-text column that merely mentions a code is
+    left alone.
+
+    Cells holding *several* codes (``"A · B · C"``) stay text — a dataframe
+    cell carries one URL, not markdown. Those live in diagnostics expanders;
+    prose renderings of the same lists go through ``linkify_bug_codes``.
+
+    A caller's own ``column_config`` wins, so a table that already knows what
+    it wants keeps it.
+    """
+    try:
+        frame = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    except (TypeError, ValueError):
+        st.dataframe(data, **kwargs)
+        return
+
+    caller_config = kwargs.pop("column_config", None) or {}
+    config, linked = dict(caller_config), {}
+    for column in frame.columns:
+        if column in caller_config or list(frame.columns).count(column) > 1:
+            continue
+        urls = link_column_values(frame[column])
+        if urls is None:
+            continue
+        linked[column] = urls
+        config[column] = st.column_config.LinkColumn(
+            str(column), display_text=r"BugCode=([^&]+)"
+        )
+
+    if linked:
+        frame = frame.copy()
+        for column, urls in linked.items():
+            frame[column] = urls
+    st.dataframe(frame, column_config=config or None, **kwargs)
 
 
 def render_bug_table(frame: pd.DataFrame) -> None:
@@ -952,7 +1039,7 @@ if active_tab == "🗺️ Module × Severity":
         st.caption(f"Showing {len(drill_df)} bugs for **{drill_group}** / **{drill_sev}**")
 
     with st.expander("Raw pivot data"):
-        st.dataframe(pv, width='stretch')
+        show_dataframe(pv, width='stretch')
 
 
 # =====================================================================
@@ -1132,7 +1219,7 @@ elif active_tab == "🏷️ Tag Analysis":
             blind_spots = at_df[at_df["AT Found Rate (%)"] == 0]
             st.subheader(f"🔴 Automation Blind Spots ({len(blind_spots)} modules with 0% AT coverage)")
             if len(blind_spots):
-                st.dataframe(blind_spots, width='stretch', hide_index=True)
+                show_dataframe(blind_spots, width='stretch', hide_index=True)
             else:
                 st.success("All modules have AT coverage!")
     else:
@@ -1714,7 +1801,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 ["parsed_module", "bug_count", "critical_count", "risk_score", "quadrant"]
             ].copy()
             top5.columns = ["Module", "Bugs", "Critical", "Risk Score", "Priority"]
-            st.dataframe(top5, width='stretch', hide_index=True)
+            show_dataframe(top5, width='stretch', hide_index=True)
 
         else:
             risk_row    = tm_agg[tm_agg["parsed_module"] == selected]
@@ -1788,7 +1875,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
         )
         cats.columns = ["Category", "Modules", "Total Bugs",
                         "Severity Weight", "Avg Risk Score", "P1 Modules"]
-        st.dataframe(cats, width='stretch', hide_index=True)
+        show_dataframe(cats, width='stretch', hide_index=True)
 
     st.subheader("🔴 P1 + P2 Modules — Test Every Build")
     q4 = tm_agg[tm_agg["quadrant"].isin(["P1 - Critical", "P2 - High"])].sort_values("risk_score", ascending=False)
@@ -2331,7 +2418,7 @@ python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
                     )
                     if not samples.empty:
                         st.markdown("**Sample bugs in this issue group:**")
-                        st.dataframe(samples, hide_index=True, width='stretch')
+                        show_dataframe(samples, hide_index=True, width='stretch')
 
             # Plain-English action — severity-based baseline
             if avg_sv <= 1.5:
@@ -2365,7 +2452,7 @@ python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
             "recurrence_rate": "Recurrence rate",
         }
         display_sum = summary[display_cols_sum].rename(columns=disp_names)
-        st.dataframe(display_sum, hide_index=True, width='stretch')
+        show_dataframe(display_sum, hide_index=True, width='stretch')
 
     # ── NEW v3.0 — Cluster velocity chart ───────────────────────────────
     if _velocity_available and "cluster_velocity_ratio" in summary.columns and "cluster_trend" in summary.columns:
@@ -2630,7 +2717,7 @@ python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
                                                  "severity_label": "Severity"})
                             )
                             if not _samples.empty:
-                                st.dataframe(_samples, hide_index=True, width='stretch')
+                                show_dataframe(_samples, hide_index=True, width='stretch')
 
 
 # =====================================================================
@@ -2973,7 +3060,7 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             "expected_s1", "expected_s2", "expected_s3plus",
             "confidence", "example_bug_codes", "latest_bug_build",
         ] if c in _top_sub.columns]
-        st.dataframe(_top_sub[_sub_cols], hide_index=True, width='stretch')
+        show_dataframe(_top_sub[_sub_cols], hide_index=True, width='stretch')
 
     # ── "What to Test This Version" — PRIMARY SECTION ──────────────────────
     st.markdown("---")
@@ -3458,7 +3545,8 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             _narrative = str(row.get("ai_narrative", "")).strip()
             if _narrative and _narrative not in ("", "nan"):
                 st.markdown("**AI risk briefing:**")
-                st.info(_narrative)
+                # The briefing is model prose and cites bug codes freely.
+                st.info(linkify_bug_codes(_narrative))
 
             st.info(f"**What to test:** {RISK_ADVICE.get(rl, '')}")
 
@@ -3514,7 +3602,7 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
         with st.expander("📋 Full leading indicators table"):
             li_display = li[["display_label", "pearson_r", "direction", "strength"]].copy()
             li_display.columns = ["Signal", "Correlation", "Direction", "Strength"]
-            st.dataframe(li_display, hide_index=True, width='stretch')
+            show_dataframe(li_display, hide_index=True, width='stretch')
 
     # ── Cross-tab cluster callout ─────────────────────────────────────────
     # Placed after leading indicators — contextual link, not an urgent alert.
@@ -3654,7 +3742,7 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                 "cluster_entropy": "Issue Group breadth",
             }
             _sig_df = _sig_df.rename(columns=_col_labels)
-            st.dataframe(_sig_df, hide_index=True, width='stretch')
+            show_dataframe(_sig_df, hide_index=True, width='stretch')
 
         # Full predictions table
         st.markdown("#### 📋 Full Predictions Table")
@@ -3686,11 +3774,11 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             "cross_module_spike": "Cross-module spike",
         }
         disp_pred = disp_pred.rename(columns=_pred_col_labels)
-        st.dataframe(disp_pred, hide_index=True, width='stretch')
+        show_dataframe(disp_pred, hide_index=True, width='stretch')
 
         if pred_cluster_df is not None and not pred_cluster_df.empty:
             st.markdown("**Bug-type predictions by cluster:**")
-            st.dataframe(
+            show_dataframe(
                 pred_cluster_df[["module", "cluster_label", "historical_pct", "predicted_count"]]
                 .rename(columns={
                     "module": "Module",
@@ -3802,8 +3890,12 @@ elif active_tab == "🎯 Release Pulse":
         st.markdown("""
 **One-line summary:** *"Which modules have in-flight bugs this version, and what should QA verify — combining live signals with ML predictions?"*
 
-**TRCreated** — Bug is in Technical Review (actively being implemented / fixed).
-**RDResolved** — Requirements/Design resolved; fix applied, awaiting QA sign-off.
+**RDResolved** — RD has applied a fix; awaiting code review, not yet in a build.
+**TRCreated** — a **T**esting **R**equest now covers the fix: it is built and
+waiting for QA to verify it. This is the last stage before Close.
+
+The observed order is `Assigned → RDResolved → NeedCodeReview → CodeReviewed →
+BuildResolved → TRCreated → Close`.
 
 These statuses mark work **not yet QA-verified** for the current version.
 The tab always reads the full unfiltered dataset — sidebar Status/Severity filters do not affect it.
@@ -4204,7 +4296,7 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
         "trc_count": "TRCreated", "rdr_count": "RDResolved",
         "closed_count": _closed_label, "total": "Total",
     })
-    st.dataframe(
+    show_dataframe(
         _display_grp,
         hide_index=True,
         column_config={"Risk Score": st.column_config.NumberColumn(format="%.3f")},
@@ -4220,7 +4312,7 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
         f"(TRCreated/RDResolved or Closed on {_closed_on.isoformat() if _closed_on else '—'})",
         expanded=False,
     ):
-        st.dataframe(df_pulse[_show_cols], hide_index=True, width="stretch")
+        show_dataframe(df_pulse[_show_cols], hide_index=True, width="stretch")
 
     # ── Ollama synthesis ───────────────────────────────────────────────────
     st.markdown("---")
@@ -4888,6 +4980,17 @@ elif active_tab == "🧪 TR Test Focus":
     flex-wrap: wrap;
     gap: .4rem;
 }
+a.tr-code-chip { color: inherit; text-decoration: none; }
+/* The focus list links the build number in its heading to the build's TR;
+   it should read as part of the title, not as a blue link. */
+div[data-testid="stMarkdownContainer"] :is(h1, h2, h3) a {
+    color: inherit;
+    text-decoration: none;
+}
+div[data-testid="stMarkdownContainer"] :is(h1, h2, h3) a:hover {
+    text-decoration: underline;
+}
+a.tr-code-chip:hover { text-decoration: underline; }
 .tr-code-chip {
     padding: .25rem .55rem;
     border: 1px solid rgba(99, 102, 241, .28);
@@ -4905,33 +5008,74 @@ div[data-testid="stExpander"] { border-radius: 12px; }
 <div class="tr-focus-hero">
   <div class="eyebrow">Regression test guidance</div>
   <h2>🧪 Newest TR Test Focus</h2>
-  <p>Start with the highest-risk regression areas, then work through each fixed-bug checklist.</p>
+  <p>Start with <strong>Waiting on you</strong> — the bugs this build's TR was created to verify — then the rest of <strong>What to test</strong>.</p>
 </div>
 """, unsafe_allow_html=True)
 
     st.caption(
-        "Verification checklists and adjacent regression recommendations generated "
-        "from the newest TR's included-bug status logs and RD fix details."
+        "A focus list assembled from what eCL and RD recorded for this Close "
+        "Build, plus a verification checklist per fixed bug, from the included-bug "
+        "status logs and RD fix details."
     )
 
     # One orientation block: what the page is, how to read it, then how it is
     # built. The deterministic rule notes live in their own expander below.
     with st.expander("📖 How to read this report", expanded=False):
         st.markdown("""
-**In short.** For the newest Testing Request, every bug the RD marked fixed in this
-Close Build is re-read — its status log and the RD's fix note — and turned into two
-things: a **checklist to verify each fix**, and a list of **nearby features worth
-re-testing** because they share code with what changed.
+**In short.** This page covers the newest **Close Build**, the build RD closed the
+newest fixes into, and the **Testing Request (TR)** eCL opened to test it. Start
+with the focus list at the top: it lists what the TR asks you to verify, and what
+changed in the build. Everything below it is supporting detail.
 
-#### The three sections
+#### The three bug lists on an eCL TR
 
-- **🎯 Recommended Regression Areas** — where a fix may have broken something else,
-  most serious first. An empty list is a normal result, not a failure: a claim is
-  published only when the quoted fix text itself supports it.
-- **✅ Per-Bug Verification** — steps to confirm each fix, built only from that bug's
-  own recorded reproduction steps and reported symptom.
-- **📈 Previous TR Prediction Check** — a coarse look back at whether a prior stored
-  build's predicted areas produced new bugs. A weak signal for tuning, not a score.
+| eCL calls it | What it is | On this page |
+|---|---|---|
+| **Bugs from which this Testing Request is created** | The bugs this TR exists to verify: the main scope of the round | **1. Waiting on you** (not verified yet) and **Already verified** |
+| **This TR Generated the following eBug(s)** | New bugs opened while testing this TR | **Found on this TR so far** |
+| **Known bugs** | Open bugs that already existed before this TR | Not shown: eCL's API does not expose this list |
+
+A TR's scope and the Close Build's fixes overlap without being the same set. A
+TR is often created from bugs closed into an earlier build whose own TR was
+cancelled, so a bug in "Waiting on you" can come from outside this build's
+fixes. Such bugs are marked with the build they were fixed into.
+
+#### The focus list (📋 What to test)
+
+Built from what eCL and RD recorded, with no model involved, so it is never empty:
+
+1. **Waiting on you**: bugs this TR was created from that nobody has verified.
+   It reads the TR live on every refresh, so it moves as colleagues verify. It
+   says *unknown*, never "nothing", when the TR could not be read.
+2. **Where the changes are**: this build's fixes ranked by module.
+3. **RD asked for this specifically**: RD's own "Risk" notes and languages.
+4. **Shared paths named in the fix notes**: RD's words for what else the
+   changed code touches.
+5. **Thin evidence**: fixes whose eCL record came back incomplete.
+6. **Seen before**: modules where these fixes have similar past defects.
+7. **Fixed earlier in this version**: fixes from earlier builds of the same
+   version, which also ship in this build.
+- **Found on this TR so far** and **Already verified** close the list. A QA
+  *Fail* counts as finished work that went back to RD, not as your to-do.
+
+The **🤖 Automated tests** expander under the list matches AT_PDRi test files
+to the changed modules (pdri only) and shows the commands. It lists them without
+running them.
+
+#### The rest of the page
+
+- **Close Build card**: the build number links to its TR (*Tested by*). **Bug
+  Creation TRs** are where this build's bugs were first *reported*, which is
+  provenance only. Those TRs tested older builds.
+- **✅ Per-Bug Verification**: steps to confirm each of this build's fixes,
+  built from that bug's recorded repro steps and symptom.
+- **🎯 Recommended Regression Areas**: AI *predictions* of what a fix may have
+  broken. The section appears only when something clears the grounding gates.
+  Otherwise it is hidden, and the withheld drafts stay under diagnostics.
+- **🗓️ Recent runs**: the last 10 days of published runs. A day with no entry
+  is a day when nothing changed, not a failed run.
+- **📈 Previous TR Prediction Check**: a rough look back at whether an earlier
+  build's predictions produced new bugs. It is a signal for tuning, not a score.
 
 #### The labels
 
@@ -4943,21 +5087,13 @@ re-testing** because they share code with what changed.
 
 #### Where the data comes from
 
-The refresh pipeline selects the newest version's **TRCreated** bugs—the cohort
-shown as "RD Resolved Bug" in the Testing Request—derives its dominant
-**Close Build#**, and fetches each bug through the TR-detail n8n workflow.
-**Bug Creation TRs** are retained only as provenance: each value is the parent
-TR where one or more bugs originated, not the Testing Request for the displayed
-Close Build.
-Ollama then produces:
-
-1. **Recommended Regression Areas** — other shared modules and code paths QA
-   should check, ranked by qualitative impact risk, labeled with evidence
-   confidence, and grounded in supporting BugCodes.
-2. **Per-Bug Verification** — concrete steps for confirming every included fix.
-
-The tab always shows the latest successfully validated report for the selected
-product. An older report remains available if a later fetch or AI run fails.
+The refresh pipeline picks the newest **Close Build#** among the **TRCreated**
+bugs, then takes *every* bug closed into that build as its cohort, whatever
+their status is now. Filtering on status would make the cohort depend on when
+the pipeline ran. Bug details come from the n8n workflow, with eCL's API as a
+backup. The TR's own bug lists come from eCL's API directly. Ollama writes the
+per-bug checklists and the regression predictions. The latest validated report
+stays on the page if a later run fails.
 
 #### Why all the fine print
 
@@ -5013,12 +5149,12 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
             try:
                 from process_newest_tr import (
                     audit_report_manifest, extract_manifest_checklists,
-                    select_newest_tr_cohort,
+                    resolve_product_artifact, select_newest_tr_cohort,
                 )
             except ModuleNotFoundError:
                 from scripts.process_newest_tr import (
                     audit_report_manifest, extract_manifest_checklists,
-                    select_newest_tr_cohort,
+                    resolve_product_artifact, select_newest_tr_cohort,
                 )
             try:
                 from tr_prediction_reviews import (
@@ -5101,15 +5237,65 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
 
             import html as _tr_html
 
+            # Loaded before the metric cards so the Close Build card can name
+            # the TR that tests it. The details file is the same artifact
+            # audit_report_manifest already hash-verified above.
+            _tr_details_fp = _tr_audit["paths"].get("details_path")
+            _tr_details, _tr_details_meta = {}, {}
+            _tr_details_unreadable = False
+            if _tr_details_fp and _tr_details_fp.exists():
+                try:
+                    _tr_details = json.loads(
+                        _tr_details_fp.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    _tr_details = {}
+                    _tr_details_unreadable = True
+                _tr_details_meta = _tr_details.get("meta") or {}
+
+            # status.json is rewritten on every attempt, an unchanged run is
+            # never republished, and the build TR's queue moves as QA verifies
+            # while the cohort stays put. So the newest lookup for this same
+            # build wins; the run's own copy is the fallback.
+            _tr_build_trs = list(_tr_details_meta.get("build_trs") or [])
+            _tr_live_build_trs = False
+            if str(_tr_status.get("selected_close_build") or "") == _tr_build:
+                _tr_status_trs = list(_tr_status.get("build_trs") or [])
+                if _tr_status_trs and (
+                    not _tr_build_trs
+                    or any(tr.get("bugs_loaded") for tr in _tr_status_trs)
+                ):
+                    _tr_live_build_trs = _tr_status_trs != _tr_build_trs
+                    _tr_build_trs = _tr_status_trs
+            _tr_build_tr_html = ""
+            _tr_build_html = _tr_html.escape(_tr_build)
+            if len(_tr_build_trs) == 1 and _tr_build_trs[0].get("tr_code"):
+                _tr_build_html = (
+                    f'<a href="{_tr_html.escape(tr_url(_tr_build_trs[0]["tr_code"]))}" '
+                    f'target="_blank" style="color:inherit">{_tr_build_html}</a>'
+                )
+            if _tr_build_trs:
+                _tr_build_tr_html = (
+                    '<div class="tr-metric-note">Tested by '
+                    + ", ".join(
+                        f'<a href="{_tr_html.escape(tr_url(tr["tr_code"]))}" '
+                        f'target="_blank">{_tr_html.escape(tr["tr_code"])}</a>'
+                        + (" (cancelled)" if tr.get("form_state") == "Cancel" else "")
+                        for tr in _tr_build_trs if tr.get("tr_code")
+                    )
+                    + "</div>"
+                )
+
             _tr_code_chips = "".join(
-                f'<span class="tr-code-chip">{_tr_html.escape(code)}</span>'
+                f'<a class="tr-code-chip" href="{_tr_html.escape(tr_url(code))}" '
+                f'target="_blank">{_tr_html.escape(code)}</a>'
                 for code in _tr_codes
             ) or '<span class="tr-code-chip">Not supplied</span>'
             st.markdown(f"""
 <div class="tr-metric-grid">
   <div class="tr-metric-card">
     <div class="tr-metric-label">Close Build</div>
-    <div class="tr-metric-value">{_tr_html.escape(_tr_build)}</div>
+    <div class="tr-metric-value">{_tr_build_html}</div>{_tr_build_tr_html}
   </div>
   <div class="tr-metric-card">
     <div class="tr-metric-label">Fixed bugs analyzed</div>
@@ -5125,6 +5311,24 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
             if _tr_generated:
                 st.caption(f"Generated {_tr_generated.replace('T', ' ')[:19]}")
 
+            # Cohort provenance qualifies every recommendation below it, so it
+            # is rendered before them.
+            _tr_changesets = {}
+            # First thing on the page: what to test, as recorded fact. The
+            # slot is reserved here and filled once the analysis is loaded
+            # below, so it renders above everything without reordering the
+            # tab's existing data loading.
+            _tr_focus_slot = st.container()
+            if _tr_details_fp and _tr_details_fp.exists():
+                if _tr_details_unreadable:
+                    st.caption("Cohort provenance could not be read.")
+                _tr_changesets = collect_changesets(_tr_details)
+
+                if _tr_details_meta:
+                    render_cohort_provenance(
+                        st, {**_tr_details_meta, "build_trs": _tr_build_trs},
+                        ECL_BUG_URL)
+
             _tr_analysis = {}
             _tr_analysis_fp = _tr_audit["paths"].get("analysis_path")
             if _tr_analysis_fp and _tr_analysis_fp.exists():
@@ -5136,6 +5340,214 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                     st.warning(
                         "Structured prediction evidence could not be displayed."
                     )
+            # Fill the reserved focus-list slot. Prefer the artifact the
+            # overnight run wrote, so the file QA reads and the page they open
+            # cannot disagree; rebuild only for runs made before it existed.
+            _tr_focus_md = ""
+            _tr_focus_note = ""
+            _tr_focus_fp = resolve_product_artifact(
+                Path(_product_dir), _tr_manifest.get("focus_list_path")
+            )
+            if _tr_focus_fp and _tr_focus_fp.is_file():
+                try:
+                    _tr_focus_md = _tr_focus_fp.read_text(encoding="utf-8")
+                except OSError:
+                    _tr_focus_md = ""
+            # A file written by an older builder is rebuilt from the same run's
+            # stored evidence (deterministic), so a content fix reaches the page
+            # without waiting for the evidence to change and republish.
+            if _tr_focus_md and not focus_list_is_current(_tr_focus_md) and _tr_details:
+                _tr_focus_md = ""
+                _tr_focus_note = (
+                    "Rebuilt in the current focus-list format from this run's "
+                    "stored evidence; the run's own file predates it."
+                )
+            elif _tr_focus_md and _tr_live_build_trs and _tr_details:
+                _tr_focus_md = ""
+                _tr_focus_note = (
+                    "“Waiting on you” reflects this build's TR as eCL reported it "
+                    f"at {str(_tr_status.get('checked_at') or '')[:16].replace('T', ' ')} "
+                    "UTC, newer than this run's stored file."
+                )
+            _tr_focus = {}
+            if _tr_details:
+                _tr_focus_details = _tr_details
+                if _tr_build_trs and _tr_build_trs != _tr_details_meta.get("build_trs"):
+                    _tr_focus_details = {
+                        **_tr_details,
+                        "meta": {**_tr_details_meta, "build_trs": _tr_build_trs},
+                    }
+                if not (_tr_details_meta.get("version_fixes")) and Path(_bugs_default).is_file():
+                    # Runs made before Stage 8 stored earlier fixes of this
+                    # version: read them from the current bug list instead.
+                    import csv as _tr_csv
+                    try:
+                        with open(_bugs_default, newline="", encoding="utf-8-sig") as _fh:
+                            _tr_vf = collect_version_fixes(
+                                list(_tr_csv.DictReader(_fh)), _tr_build,
+                                [str(b.get("BugCode")) for _v in
+                                 (_tr_details.get("products") or {}).values() for b in _v],
+                            )
+                    except (OSError, _tr_csv.Error):
+                        _tr_vf = {}
+                    if _tr_vf:
+                        _tr_focus_details = {
+                            **_tr_focus_details,
+                            "meta": {**(_tr_focus_details.get("meta") or {}),
+                                     "version_fixes": _tr_vf},
+                        }
+                        if not _tr_focus_md:
+                            _tr_focus_note += (
+                                " Earlier fixes in this version were read from the "
+                                "current bug list — this run predates storing them."
+                            )
+                try:
+                    _tr_focus = build_focus_list(_tr_focus_details, _tr_analysis)
+                except (KeyError, TypeError, ValueError):
+                    _tr_focus = {}
+            if not _tr_focus_md and _tr_focus:
+                _tr_focus_md = focus_list_markdown(_tr_focus, _tr_generated)
+            # ``focus_list_markdown`` links codes itself, so this is a no-op for
+            # anything written since. A file promoted before it did is served
+            # from the run directory verbatim and would otherwise be the one
+            # place on the page where a bug code is not clickable. Applied
+            # before the download too: QA reads the file more than the page.
+            _tr_focus_md = linkify_bug_codes(_tr_focus_md)
+            if _tr_focus_md:
+                with _tr_focus_slot:
+                    with st.container(border=True):
+                        st.markdown(_tr_focus_md)
+                    if _tr_focus_note:
+                        st.caption(_tr_focus_note.strip())
+                    st.download_button(
+                        "Download this list", _tr_focus_md,
+                        file_name="what_to_test_"
+                        + _tr_re.sub(r"[^A-Za-z0-9._-]+", "_", _tr_build)
+                        + ".md",
+                        mime="text/markdown",
+                        key=f"tr_focus_dl_{selected_slug}",
+                    )
+                    # AT_PDRi cases for the changed modules, read from that repo
+                    # at render time — so kept out of the run's focus_list.md.
+                    if _tr_focus and selected_slug in AT_REPOS:
+                        _tr_at_repo = at_repo_dir(selected_slug)
+                        _tr_at_set = configured_at_dir(selected_slug)
+                        _tr_at_files, _tr_at, _tr_at_sel = [], {}, []
+                        if _tr_at_repo is not None:
+                            _tr_at_files = _load_at_index(str(_tr_at_repo))
+                            _tr_at = at_cases_for_focus(_tr_focus, _tr_at_files)
+                            _tr_at_sel = _tr_at["selected"]
+                        _tr_at_label = (
+                            f"🤖 Automated tests for this build — "
+                            f"{len(_tr_at_sel)} AT file(s), "
+                            f"{sum(e['case_count'] for e in _tr_at_sel)} case(s), "
+                            "not run yet"
+                            if _tr_at_repo is not None else
+                            "🤖 Automated tests for this build — no AT folder set"
+                        )
+                        with st.expander(_tr_at_label, expanded=_tr_at_repo is None):
+                            # Saved to .at_repos.json, so it is set once per
+                            # machine and every later render reuses it.
+                            with st.form(f"tr_at_dir_{selected_slug}", border=False):
+                                _tr_at_input = st.text_input(
+                                    "AT repo folder",
+                                    value=_tr_at_set,
+                                    placeholder="/Users/<you>/Desktop/AT_PDRi",
+                                    help="The AT repo root — the folder holding "
+                                         "tests/new_bft_ios and tests/new_sft_ios. "
+                                         "Remembered on this machine.",
+                                )
+                                if st.form_submit_button("Save folder"):
+                                    try:
+                                        save_at_repo_dir(selected_slug, _tr_at_input)
+                                    except (ValueError, OSError) as _exc:
+                                        st.error(f"Not saved: {_exc}")
+                                    else:
+                                        _load_at_index.clear()
+                                        st.rerun()
+                            if os.environ.get(AT_REPOS[selected_slug]):
+                                st.caption(
+                                    f"`${AT_REPOS[selected_slug]}` is set and "
+                                    "overrides the saved folder."
+                                )
+                            if _tr_at_repo is None:
+                                st.info(
+                                    "No AT folder set, so no automated cases are "
+                                    "listed. Save the AT repo folder above."
+                                    if not _tr_at_set else
+                                    f"The saved AT folder `{_tr_at_set}` no longer "
+                                    "exists. Save its new location above."
+                                )
+                            else:
+                                _tr_at_cmds = pytest_commands(
+                                    _tr_at_sel, _tr_at_files, _tr_build)
+                                st.caption(
+                                    f"From `{_tr_at_repo}`. Listed only; nothing "
+                                    "is triggered from this page. Selected by "
+                                    "file: every case is a dependency chain, so "
+                                    "a case cannot run without the ones before it."
+                                )
+                                if _tr_at_sel:
+                                    show_dataframe(
+                                        pd.DataFrame([
+                                            {"Suite": e["suite"],
+                                             "Module": e["module"],
+                                             "Why": e["reason"],
+                                             "Entry point": c["description"] or c["name"],
+                                             "Cases": len(c["cases"]),
+                                             "File": e["file"].rsplit("/", 1)[-1]}
+                                            for e in _tr_at_sel for c in e["classes"]
+                                        ]),
+                                        hide_index=True, use_container_width=True,
+                                    )
+                                    st.download_button(
+                                        "Download the full case list (CSV)",
+                                        pd.DataFrame([
+                                            {"suite": e["suite"], "module": e["module"],
+                                             "reason": e["reason"],
+                                             "node_id": case["node_id"],
+                                             "step": case["title"]}
+                                            for e in _tr_at_sel for c in e["classes"]
+                                            for case in c["cases"]
+                                        ]).to_csv(index=False),
+                                        file_name="at_cases_"
+                                        + _tr_re.sub(r"[^A-Za-z0-9._-]+", "_", _tr_build)
+                                        + ".csv",
+                                        mime="text/csv",
+                                        key=f"tr_at_dl_{selected_slug}",
+                                    )
+                                    for _suite, _cmd in _tr_at_cmds.items():
+                                        st.markdown(
+                                            "**BFT** — quick pass; installs this "
+                                            "Close Build first:"
+                                            if _suite == "BFT" else
+                                            "**SFT** — full checklist, changed and "
+                                            "regression modules; installs this Close "
+                                            "Build first and ends with the My "
+                                            "Artwork sweep. Hours of rendering, "
+                                            "and it spends credits:"
+                                        )
+                                        st.code(_cmd, language="bash")
+                                    _tr_costly = [
+                                        e["file"].rsplit("/", 1)[-1] for e in _tr_at_sel
+                                        if e["cost_warning"] and e["suite"] == "SFT"
+                                    ]
+                                    if _tr_costly:
+                                        st.warning(
+                                            "Carries a COST WARNING in AT_PDRi: "
+                                            + ", ".join(f"`{f}`" for f in _tr_costly)
+                                            + ". Run with `TTV_SUBMIT_GENERATIONS=0` "
+                                            "to check locators without submitting "
+                                            "generations."
+                                        )
+                                if _tr_at["unmatched"]:
+                                    st.caption(
+                                        "No AT file for: " + ", ".join(
+                                            f"{u['module']} ({u['reason']})"
+                                            for u in _tr_at["unmatched"]
+                                        )
+                                    )
+
             _tr_quality = _tr_analysis.get("evidence_quality_counts") or {}
             if _tr_quality:
                 st.caption(
@@ -5155,7 +5567,8 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
             )
             if _tr_fallback_count:
                 _tr_fallback_codes = ", ".join(
-                    str(item.get("bug_code") or "?")
+                    bug_link(item.get("bug_code"), code_style=False)
+                    or "?"
                     for item in _tr_checklist_gen.get("deterministic_fallbacks") or []
                 )
                 st.caption(
@@ -5166,6 +5579,115 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                 )
             # Reserve the main workflow ahead of methodology and audit output.
             _tr_work_slot = st.container()
+
+            # ── Recent history ───────────────────────────────────────────
+            # Everything above describes one run. Stage 8 never rewrites a
+            # published run, so the run tree is already a record of the past
+            # builds and of how each cohort grew during a day; only
+            # latest.json is overwritten. This reads that tree — no fetching,
+            # no re-analysis — and renders after the current work so it stays
+            # reference material rather than competing with "what to test".
+            st.markdown("### 🗓️ Recent runs")
+            _tr_hist_days = st.radio(
+                "Window", [7, DEFAULT_HISTORY_DAYS, 30], index=1, horizontal=True,
+                format_func=lambda value: f"Last {value} days",
+                key=f"tr_hist_days_{selected_slug}", label_visibility="collapsed",
+            )
+            _tr_hist_current = current_run_dir(Path(_product_dir), _tr_manifest)
+            _tr_hist = run_history(
+                Path(_product_dir), days=int(_tr_hist_days),
+                current_dir=_tr_hist_current,
+            )
+            if not _tr_hist:
+                st.caption(
+                    "No TR Test Focus run was published for this product in the "
+                    f"last {int(_tr_hist_days)} days."
+                )
+            else:
+                _tr_hist_digest = history_digest(_tr_hist, int(_tr_hist_days))
+                st.caption(
+                    f"{_tr_hist_digest['run_count']} published run(s) on "
+                    f"{_tr_hist_digest['days_with_runs']} day(s), covering "
+                    f"{len(_tr_hist_digest['builds'])} Close Build(s). A run is "
+                    "published only when the evidence, the model, or the analysis "
+                    "schema changed, so a day with no entry is a day nothing "
+                    "changed — not a failed run. Only the newest attempt keeps a "
+                    "status, so failures leave no trace here."
+                )
+                show_dataframe(
+                    pd.DataFrame([
+                        {
+                            "Run (UTC)": row["run_at"].strftime("%Y-%m-%d %H:%M"),
+                            "Close Build": row["close_build"],
+                            # Kept as text: a run with no recorded count would
+                            # otherwise mix int and str in one Arrow column.
+                            "Bugs": (
+                                "—" if row["bug_count"] is None
+                                else str(row["bug_count"])
+                            ),
+                            # "0" and "—" are different answers: the cohort
+                            # did not change, versus there is nothing to
+                            # compare it with.
+                            "Δ same build": (
+                                "—" if row["bug_delta"] is None
+                                else f"{row['bug_delta']:+d}" if row["bug_delta"]
+                                else "0"
+                            ),
+                            "Model": row["model"] or "—",
+                            "Showing now": "✅" if row["is_current"] else "",
+                            "Run ID": row["run_id"],
+                        }
+                        for row in _tr_hist
+                    ]),
+                    hide_index=True, width="stretch",
+                )
+                st.caption(
+                    "**Δ same build** compares a run with the previous run of the "
+                    "*same* Close Build — a cohort that grew during the day as more "
+                    "bugs closed into the build. It is blank across a build change, "
+                    "where the two numbers are different cohorts rather than a change "
+                    "in one."
+                )
+                if not any(row["is_current"] for row in _tr_hist):
+                    st.caption(
+                        "⚠️ The report shown above was published before this window "
+                        "and so has no row here."
+                    )
+
+                _tr_hist_labels = {
+                    (
+                        f"{row['run_at']:%Y-%m-%d %H:%M} · {row['close_build']}"
+                        + (
+                            f" · {row['bug_count']} bugs"
+                            if row["bug_count"] is not None else ""
+                        )
+                        + (" · showing now" if row["is_current"] else "")
+                    ): row
+                    for row in _tr_hist
+                }
+                _tr_hist_pick = st.selectbox(
+                    "Open the focus list from a past run",
+                    list(_tr_hist_labels),
+                    key=f"tr_hist_pick_{selected_slug}",
+                )
+                _tr_hist_row = _tr_hist_labels[_tr_hist_pick]
+                _tr_hist_md, _tr_hist_note = run_focus_list(_tr_hist_row)
+                _tr_hist_md = linkify_bug_codes(_tr_hist_md)
+                st.caption(_tr_hist_note)
+                if _tr_hist_md:
+                    with st.container(border=True):
+                        st.markdown(_tr_hist_md)
+                    st.download_button(
+                        "Download this past list", _tr_hist_md,
+                        file_name="what_to_test_"
+                        + _tr_re.sub(
+                            r"[^A-Za-z0-9._-]+", "_", _tr_hist_row["close_build"]
+                        )
+                        + "_" + _tr_hist_row["run_id"] + ".md",
+                        mime="text/markdown",
+                        key=f"tr_hist_dl_{selected_slug}",
+                    )
+
             st.markdown("### Report evidence & diagnostics")
             _tr_schema = int(_tr_analysis.get("schema_version") or 0)
             _tr_guardrail_labels = {
@@ -5752,7 +6274,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                 "response. They are a model-quality signal, not "
                                 "a judgement about the build."
                             )
-                            st.dataframe(
+                            show_dataframe(
                                 pd.DataFrame([
                                     {
                                         "Discovery path": str(
@@ -5855,7 +6377,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                 "Drafts withheld by deterministic evidence gate",
                                 expanded=False,
                             ):
-                                st.dataframe([
+                                show_dataframe([
                                     {
                                         "Candidate ID": str(
                                             record.get("candidate_id") or ""
@@ -5912,23 +6434,35 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                     "evidence_ref_completion_applied_count"
                                 ) or 0
                             )
+                            _tr_ref_completion_recovers_families = int(
+                                _tr_analysis.get("schema_version") or 0
+                            ) >= 40
                             _tr_run_notes.append(
                                 "**Deterministic reference recovery** — "
                                 f"{_tr_ref_completion_count} discovered draft"
                                 + (
                                     "s" if _tr_ref_completion_count != 1 else ""
                                 )
-                                + " named a target present in another exact signal "
-                                "from an already-cited BugCode. Those references were "
+                                + (
+                                    " named a target, or invoked a stated fix "
+                                    "family, that was present in another exact "
+                                    "signal from an already-cited BugCode."
+                                    if _tr_ref_completion_recovers_families
+                                    else " named a target present in another "
+                                    "exact signal from an already-cited BugCode."
+                                )
+                                + " Those references were "
                                 "added within the four-reference cap before the target "
                                 "gate; no BugCode or synonym scope was added."
                             )
                             if _tr_ref_completion_records:
                                 with st.expander(
-                                    "Target references recovered before evidence gate",
+                                    "Exact references recovered before evidence gate"
+                                    if _tr_ref_completion_recovers_families
+                                    else "Target references recovered before evidence gate",
                                     expanded=False,
                                 ):
-                                    st.dataframe([
+                                    show_dataframe([
                                         {
                                             "Candidate ID": str(
                                                 record.get("candidate_id") or ""
@@ -5986,7 +6520,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                     "Predictions supported by reviewed vocabulary",
                                     expanded=False,
                                 ):
-                                    st.dataframe([
+                                    show_dataframe([
                                         {
                                             "Candidate ID": str(
                                                 record.get("candidate_id") or ""
@@ -6020,7 +6554,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "Coverage-challenge variants filtered before grounding",
                             expanded=False,
                         ):
-                            st.dataframe([
+                            show_dataframe([
                                 {
                                     "Candidate ID": str(
                                         record.get("candidate_id") or ""
@@ -6198,7 +6732,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "recommendation. In schema 14, every displayed row first "
                             "passed the final adversarial grounding audit."
                         )
-                        st.dataframe(
+                        show_dataframe(
                             pd.DataFrame(_tr_coverage_rows),
                             width="stretch",
                             hide_index=True,
@@ -6224,7 +6758,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "Coverage novelty affects membership only inside the "
                             "single risk/confidence tier crossing the cutoff."
                         )
-                        st.dataframe(
+                        show_dataframe(
                             pd.DataFrame([{
                                 "Selection round": int(
                                     record.get("selection_round") or 0
@@ -6292,7 +6826,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "outside the diversified slots within the equal cutoff "
                             "tier; their original priority and reason remain frozen."
                         )
-                        st.dataframe(
+                        show_dataframe(
                             pd.DataFrame(_tr_portfolio_rows),
                             width="stretch",
                             hide_index=True,
@@ -6351,7 +6885,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "confidence. It reached synthesis only after a fresh "
                             "six-check adversarial pass."
                         )
-                        st.dataframe(
+                        show_dataframe(
                             pd.DataFrame(_tr_recovered_rows),
                             width="stretch",
                             hide_index=True,
@@ -6436,7 +6970,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "recommendations. Historical analogs cannot rescue missing "
                             "current-fix grounding."
                         )
-                        st.dataframe(
+                        show_dataframe(
                             pd.DataFrame(_tr_withheld_rows),
                             width="stretch",
                             hide_index=True,
@@ -6515,7 +7049,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                         ),
                                     })
                             if _tr_grounding_breakdown_rows:
-                                st.dataframe(
+                                show_dataframe(
                                     pd.DataFrame(_tr_grounding_breakdown_rows),
                                     width="stretch",
                                     hide_index=True,
@@ -6538,7 +7072,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                 "bound showing repeated alias-specific failures. Matcher "
                                 "and other rejection reasons cannot retire an alias."
                             )
-                            st.dataframe(pd.DataFrame([{
+                            show_dataframe(pd.DataFrame([{
                                 "Alias": (
                                     f"{row.get('target_term')} → "
                                     f"{row.get('evidence_term')}"
@@ -6959,9 +7493,9 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             "proposed could be tied to quoted text in these fixes, "
                             "which is a normal outcome, not an error."
                         )
-                        st.markdown(
+                        st.markdown(linkify_bug_codes(
                             "\n".join(f"- {note}" for note in _tr_run_notes)
-                        )
+                        ))
 
             if _tr_missing_details:
                 _tr_missing_links = " · ".join(
@@ -7008,74 +7542,76 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                 )
 
                 with _tr_work_slot:
-                    st.markdown("### 🎯 Recommended Regression Areas")
-                    st.caption(
-                        "Prioritized cross-feature checks. Risk is classified from the "
-                        "observable failure and capped by evidence confidence; "
-                        "confidence describes the deterministic strength and independence "
-                        "of the supplied current-fix evidence."
-                    )
                     _tr_structured_recommendations = (
                         _tr_analysis.get("recommendations") or []
                     )
-                    if _tr_structured_recommendations:
-                        render_recommendation_groups(st, _tr_analysis, ECL_BUG_URL)
-                    elif _tr_regression:
-                        st.markdown(_tr_regression)
-                    else:
-                        st.info("No regression recommendations were found in this report.")
-                    if not _tr_structured_recommendations:
-                        _tr_independence = (
-                            _tr_analysis.get("evidence_independence_by_bug") or {}
+                    # Publish-or-hide. An empty predictions section is noise on
+                    # a page whose job is telling QA what to test, and this one
+                    # is empty whenever the grounding gates do their job. The
+                    # Focus List above carries the coverage; withheld drafts
+                    # stay under *Candidates withheld by grounding audit* in the
+                    # diagnostics expander for anyone tuning the gates.
+                    # The narrative report is never empty: when nothing is
+                    # grounded it still carries the NO_GROUNDED_REGRESSION
+                    # sentence, so a plain truthiness test keeps the section
+                    # alive showing exactly the empty state we are hiding.
+                    _tr_regression_has_content = bool(
+                        _tr_regression
+                        and NO_GROUNDED_REGRESSION not in _tr_regression
+                    )
+                    if _tr_structured_recommendations or _tr_regression_has_content:
+                        st.markdown("### 🎯 Recommended Regression Areas")
+                        st.caption(
+                            "Prioritized cross-feature checks. Risk is classified from "
+                            "the observable failure and capped by evidence confidence; "
+                            "confidence describes the deterministic strength and "
+                            "independence of the supplied current-fix evidence."
                         )
-                        _tr_signal_bugs = sum(
-                            1 for item in _tr_independence.values()
-                            if isinstance(item, dict)
-                            and item.get("adjacency_signal_quotes")
-                        )
-                        _tr_withheld_total = int(
-                            (_tr_grounding_audit or {}).get(
-                                "withheld_candidate_count"
-                            ) or 0
-                        ) + int(
-                            (_tr_grounding_audit or {}).get(
-                                "final_recommendation_withheld_count"
-                            ) or 0
-                        ) + int(
-                            ((_tr_grounding_audit or {}).get(
-                                "candidate_discovery_audit"
-                            ) or {}).get("adjacency_gate_withheld_count") or 0
-                        )
-                        if _tr_withheld_total:
-                            st.caption(
-                                f"Nothing was published, but {_tr_withheld_total} draft"
-                                + ("s were" if _tr_withheld_total != 1 else " was")
-                                + " proposed and withheld for lack of grounding. Open "
-                                "*Candidates withheld by grounding audit* below to see "
-                                "each area and the check it failed — a withheld draft is "
-                                "a lead to judge, not a verdict."
-                            )
-                        elif _tr_independence and not _tr_signal_bugs:
-                            st.caption(
-                                "Nothing beyond the fixes themselves is being recommended "
-                                f"for this build. None of the {len(_tr_independence)} fix "
-                                "notes described a shared path — a component, cache, "
-                                "manager, service, pipeline, or an effect stated to reach "
-                                "other areas — and no RD flagged a regression risk, so "
-                                "there was no evidence to extrapolate from and no claim "
-                                "was proposed. Localized, self-contained fixes routinely "
-                                "land here. Continue with the per-bug checklists below."
+                        if _tr_structured_recommendations:
+                            render_recommendation_groups(
+                                st, _tr_analysis, ECL_BUG_URL, _tr_changesets
                             )
                         else:
-                            st.caption(
-                                "Nothing beyond the fixes themselves is being recommended "
-                                "for this build. An adjacent area is published only when "
-                                "the RD's own fix wording names both the area and the "
-                                "mechanism connecting it to the fix. See *What happened "
-                                "when this report was built* below for how many claims "
-                                "were proposed and where they stopped, and continue with "
-                                "the per-bug checklists below."
-                            )
+                            st.markdown(linkify_bug_codes(_tr_regression))
+                    _tr_coverage_floor = (
+                        _tr_analysis.get("regression_coverage_floor") or {}
+                    )
+                    _tr_floor_entries = [
+                        entry for entry in (_tr_coverage_floor.get("entries") or [])
+                        if isinstance(entry, dict)
+                    ]
+                    if _tr_floor_entries:
+                        st.markdown("#### 🧭 Baseline Coverage")
+                        st.caption(
+                            "Not adjacency predictions, and deliberately unrated — "
+                            "these carry no risk, confidence or priority. They name "
+                            "where each fixed module sits and what its history shows, "
+                            "so every fixed bug has a starting point even when no "
+                            "adjacent area is supportable from the fix details. They "
+                            "are never scored against the next build."
+                        )
+                        _tr_floor_label = {
+                            "module_history": "Module history",
+                            "fixed_surface": "Fixed surface",
+                        }
+                        show_dataframe([
+                            {
+                                "Area": str(entry.get("area") or ""),
+                                "Basis": _tr_floor_label.get(
+                                    str(entry.get("basis") or ""), "Baseline"
+                                ),
+                                "Category": str(entry.get("module_category") or ""),
+                                "Action": str(entry.get("action") or ""),
+                                "Why": str(entry.get("why") or ""),
+                                "Source bug": str(entry.get("source_bug_code") or ""),
+                                "Past bugs": ", ".join(
+                                    str(ref.get("analog_bug_code") or "")
+                                    for ref in entry.get("historical_analog_refs") or []
+                                    if isinstance(ref, dict)
+                                ),
+                            }
+                            for entry in _tr_floor_entries
+                        ], hide_index=True, width="stretch")
                     st.markdown("### ✅ Per-Bug Verification")
                     _tr_filter = st.text_input(
                         "Filter verification checklists",
@@ -7106,7 +7642,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             r"^##[^\n]*\n?", "", _tr_block, count=1
                         ).strip()
                         with st.expander(checklist_label(_tr_code, _tr_analysis), expanded=False):
-                            st.markdown(_tr_body)
+                            st.markdown(linkify_bug_codes(_tr_body))
                             if _tr_code != "Checklist":
                                 st.markdown(
                                     f"[Open {_tr_code} in eCL ↗]"
@@ -7133,7 +7669,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                         "🔎 Evidence & reasoning", expanded=False
                     ):
                         st.caption("Original stored recommendations, including any instructions flagged for review.")
-                        st.markdown(_tr_regression)
+                        st.markdown(linkify_bug_codes(_tr_regression))
                         st.caption(
                             "Each reference was validated against the stored RD "
                             "root-cause, solution, or stated-risk evidence."
@@ -7631,7 +8167,10 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             for _tr_ref in (_tr_rec.get("evidence_refs") or []):
                                 if not isinstance(_tr_ref, dict):
                                     continue
-                                _tr_ref_code = str(_tr_ref.get("bug_code") or "Unknown")
+                                _tr_ref_code = (
+                                    bug_link(_tr_ref.get("bug_code"), code_style=False)
+                                    or "Unknown"
+                                )
                                 _tr_ref_quote = str(_tr_ref.get("quote") or "").strip()
                                 _tr_ref_slot = int(_tr_ref.get("signal_index") or 0) + 1
                                 st.caption(
@@ -7643,8 +8182,12 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                             ):
                                 if not isinstance(_tr_analog, dict):
                                     continue
-                                _tr_analog_code = str(
-                                    _tr_analog.get("analog_bug_code") or "Unknown"
+                                _tr_analog_code = (
+                                    bug_link(
+                                        _tr_analog.get("analog_bug_code"),
+                                        code_style=False,
+                                    )
+                                    or "Unknown"
                                 )
                                 _tr_analog_module = str(
                                     _tr_analog.get("module") or "Unknown module"
@@ -7843,7 +8386,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                 "calibrators. Free-form reviewer notes are never sent "
                                 "to Ollama."
                             )
-                            st.dataframe(
+                            show_dataframe(
                                 pd.DataFrame(_tr_guardrail_rows),
                                 width="stretch",
                                 hide_index=True,
@@ -7946,7 +8489,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                     "engine, and applied-policy provenance."
                                 )
                             if _tr_effectiveness_rows:
-                                st.dataframe(
+                                show_dataframe(
                                     pd.DataFrame(_tr_effectiveness_rows),
                                     width="stretch",
                                     hide_index=True,
@@ -8042,7 +8585,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                     "decisive reviews without exact schema-11 coherent "
                                     "claim lineage and run configuration."
                                 )
-                            st.dataframe(
+                            show_dataframe(
                                 pd.DataFrame(_tr_repair_rows),
                                 width="stretch",
                                 hide_index=True,
@@ -8607,7 +9150,7 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                                 ))
                     if _tr_eval_rows:
                         with st.expander("Review hypothesis outcomes", expanded=False):
-                            st.dataframe(
+                            show_dataframe(
                                 pd.DataFrame(_tr_eval_rows),
                                 width="stretch",
                                 hide_index=True,
@@ -9075,8 +9618,104 @@ shown to you. *Rules that constrain these predictions* lists those rules, and
                     else:
                         st.info(
                             "The prior report contained no scoreable adjacent "
-                            "regression hypotheses."
+                            "regression hypotheses — it published none. What it "
+                            "did leave behind is the drafts its gates declined, "
+                            "scored below as a tuning signal."
                         )
+                    _tr_withheld_retro = (
+                        _tr_prior_eval.get("withheld_draft_retrospective") or {}
+                    )
+                    _tr_retro_rows = [
+                        row for row in (_tr_withheld_retro.get("drafts") or [])
+                        if isinstance(row, dict)
+                    ]
+                    if _tr_retro_rows:
+                        st.markdown("#### 🚧 Withheld Draft Check")
+                        st.caption(
+                            "Not predictions and not scored as such — these were "
+                            "declined. This asks whether the bar was too high: "
+                            "did a gate stop a draft in a category that then "
+                            "produced a bug? A category overlap does not mean the "
+                            "draft was right; the predicted area is often not the "
+                            "area that failed, which is why the check that "
+                            "stopped each draft is shown."
+                        )
+                        _tr_retro_overlaps = int(
+                            _tr_withheld_retro.get("category_overlap_count") or 0
+                        )
+                        _tr_retro_evaluable = int(
+                            _tr_withheld_retro.get("category_evaluable_count") or 0
+                        )
+                        _tr_retro_features = int(
+                            _tr_withheld_retro.get("feature_candidate_count") or 0
+                        )
+                        _tr_retro_areas = [
+                            str(area) for area in
+                            _tr_withheld_retro.get("distinct_overlap_areas") or []
+                        ]
+                        _tr_retro_cols = st.columns(4)
+                        _tr_retro_cols[0].metric(
+                            "Withheld drafts",
+                            int(_tr_withheld_retro.get("withheld_draft_count") or 0),
+                        )
+                        _tr_retro_cols[1].metric(
+                            "Category-evaluable", _tr_retro_evaluable
+                        )
+                        _tr_retro_cols[2].metric(
+                            "Category overlaps", _tr_retro_overlaps
+                        )
+                        _tr_retro_cols[3].metric(
+                            "Feature candidates", _tr_retro_features
+                        )
+                        if _tr_retro_overlaps and not _tr_retro_features:
+                            st.caption(
+                                f"{_tr_retro_overlaps} declined draft"
+                                + ("s" if _tr_retro_overlaps != 1 else "")
+                                + " sat in a category this build produced a bug "
+                                "in, across "
+                                + str(len(_tr_retro_areas))
+                                + " distinct area"
+                                + ("s" if len(_tr_retro_areas) != 1 else "")
+                                + (f" ({', '.join(_tr_retro_areas)})"
+                                   if _tr_retro_areas else "")
+                                + " — but none matched the failing feature. "
+                                "Category alone is weak evidence that the bar is "
+                                "too high; treat the repeated check below as the "
+                                "thing to look at, not as a miss."
+                            )
+                        _tr_retro_check_counts = (
+                            _tr_withheld_retro.get("overlap_failed_check_counts")
+                            or {}
+                        )
+                        if _tr_retro_check_counts:
+                            _tr_retro_top = max(
+                                _tr_retro_check_counts.items(),
+                                key=lambda pair: (pair[1], pair[0]),
+                            )
+                            st.caption(
+                                "Most frequent check among overlapping drafts: "
+                                f"**{str(_tr_retro_top[0]).replace('_', ' ')}** "
+                                f"({_tr_retro_top[1]} of {_tr_retro_overlaps})."
+                            )
+                        show_dataframe([
+                            {
+                                "Area": str(row.get("area") or ""),
+                                "Category": str(row.get("target_category") or ""),
+                                "Result": str(row.get("result") or "")
+                                .replace("_", " "),
+                                "Stopped by": str(row.get("withheld_reason") or "")
+                                .replace("_", " "),
+                                "Failed check": ", ".join(
+                                    str(check).replace("_", " ")
+                                    for check in row.get("failed_checks") or []
+                                ),
+                                "Bugs in category": ", ".join(
+                                    str(code) for code in
+                                    row.get("observed_bug_codes") or []
+                                ),
+                            }
+                            for row in _tr_retro_rows
+                        ], hide_index=True, width="stretch")
 
 
             else:
